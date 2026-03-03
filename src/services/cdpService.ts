@@ -81,6 +81,10 @@ export class CdpService extends EventEmitter {
     private currentWorkspacePath: string | null = null;
     /** Workspace switching flag (suppresses disconnected event) */
     private isSwitchingWorkspace: boolean = false;
+    /** Heartbeat interval timer */
+    private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+    /** Timestamp of last pong received */
+    private lastPongTime: number = 0;
 
     constructor(options: CdpServiceOptions = {}) {
         super();
@@ -207,6 +211,7 @@ export class CdpService extends EventEmitter {
         });
 
         this.ws.on('close', () => {
+            this.stopHeartbeat();
             this.isConnectedFlag = false;
             // Reject all unresolved pending calls to prevent memory leaks
             this.clearPendingCalls(new Error('WebSocket disconnected'));
@@ -231,6 +236,8 @@ export class CdpService extends EventEmitter {
             // Network.enable failure is non-fatal; polling fallback still works
             logger.warn('[CdpService] Network.enable failed — network event detection disabled');
         }
+
+        this.startHeartbeat();
     }
 
     async call(method: string, params: any = {}): Promise<any> {
@@ -253,6 +260,7 @@ export class CdpService extends EventEmitter {
     }
 
     async disconnect(): Promise<void> {
+        this.stopHeartbeat();
         // Suppress reconnection during intentional disconnect
         const savedMaxReconnectAttempts = this.maxReconnectAttempts;
         this.maxReconnectAttempts = 0;
@@ -713,6 +721,7 @@ export class CdpService extends EventEmitter {
      * from reconnecting to a different workbench.
      */
     private disconnectQuietly(): void {
+        this.stopHeartbeat();
         if (this.ws) {
             // Remove all listeners including close event handlers to prevent side effects
             this.ws.removeAllListeners();
@@ -722,6 +731,42 @@ export class CdpService extends EventEmitter {
             this.contexts = [];
             this.clearPendingCalls(new Error('Disconnected for workspace switch'));
             this.targetUrl = null;
+        }
+    }
+
+    /**
+     * Start WebSocket ping/pong heartbeat.
+     * Pings every 30s; if no pong within 40s, terminates the socket (triggers close → reconnect).
+     */
+    private startHeartbeat(): void {
+        this.stopHeartbeat();
+        if (!this.ws) return;
+        this.lastPongTime = Date.now();
+
+        this.ws.on('pong', () => {
+            this.lastPongTime = Date.now();
+        });
+
+        this.heartbeatInterval = setInterval(() => {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                this.stopHeartbeat();
+                return;
+            }
+            if (Date.now() - this.lastPongTime > 40_000) {
+                logger.error('[CdpService] Heartbeat: no pong in 40s — terminating WebSocket');
+                this.ws.terminate();
+                this.stopHeartbeat();
+                return;
+            }
+            this.ws.ping();
+        }, 30_000);
+    }
+
+    /** Stop the heartbeat interval. */
+    private stopHeartbeat(): void {
+        if (this.heartbeatInterval) {
+            clearInterval(this.heartbeatInterval);
+            this.heartbeatInterval = null;
         }
     }
 

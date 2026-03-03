@@ -188,7 +188,7 @@ export function parseErrorPopupCustomId(customId: string): { action: 'dismiss' |
 export function initCdpBridge(autoApproveDefault: boolean): CdpBridge {
     const pool = new CdpConnectionPool({
         cdpCallTimeout: 15000,
-        maxReconnectAttempts: 0,
+        maxReconnectAttempts: 3,
         reconnectDelayMs: 3000,
     });
 
@@ -209,8 +209,16 @@ export function initCdpBridge(autoApproveDefault: boolean): CdpBridge {
 }
 
 export function getCurrentCdp(bridge: CdpBridge): CdpService | null {
-    if (!bridge.lastActiveWorkspace) return null;
-    return bridge.pool.getConnected(bridge.lastActiveWorkspace);
+    if (bridge.lastActiveWorkspace) {
+        const cdp = bridge.pool.getConnected(bridge.lastActiveWorkspace);
+        if (cdp) return cdp;
+    }
+    // Fallback: return any connected workspace
+    const activeNames = bridge.pool.getActiveWorkspaceNames();
+    if (activeNames.length > 0) {
+        return bridge.pool.getConnected(activeNames[0]);
+    }
+    return null;
 }
 
 async function sendTelegramMessage(

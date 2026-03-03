@@ -162,7 +162,8 @@ export function extractAssistantSegmentsPayloadScript(): string {
         // Strip leading emoji/non-letter chars for matching
         var stripped = normalized.replace(/^[^a-z]+/i, '');
         if (/^(?:analy[sz]ing|reading|writing|running|searching|planning|thinking|processing|loading|executing|testing|debugging|fetching|connecting|creating|updating|deleting|installing|building|compiling|deploying|checking|scanning|parsing|resolving|downloading|uploading|analyzed|read|wrote|ran|created|updated|deleted|fetched|built|compiled|installed|resolved|downloaded|connected)\\b/i.test(stripped) && normalized.length <= 220) return true;
-        if (/^initiating\\s/i.test(stripped) && normalized.length <= 500) return true;
+        // "Initiating..." removed — too broad; catches response body text like
+        // "Initiating Task Execution I'm now ready to..." causing false activity entries.
         if (/^thought for\\s/i.test(stripped) && normalized.length <= 500) return true;
         return false;
     };
@@ -313,7 +314,9 @@ export function extractAssistantSegmentsPayloadScript(): string {
             var child = children[ci];
             if (child.tagName === 'SUMMARY' || child.tagName === 'STYLE') continue;
             var childText = (child.innerText || child.textContent || '').trim();
-            if (!childText || childText.length < 2) continue;
+            if (!childText || childText.length < 5) continue;
+            // Skip junk: pure numbers, single words under 8 chars
+            if (/^\\d+$/.test(childText)) continue;
             if (isThinkingBlock) {
                 // Thinking body content — preserve more text for display
                 segments.push({
@@ -355,12 +358,34 @@ export function extractAssistantSegmentsPayloadScript(): string {
         // Skip nodes inside response body containers (prevents capturing inline words)
         if (el.closest('.leading-relaxed, .rendered-markdown, .prose, .animate-markdown, [data-message-role], [data-message-author-role]')) continue;
         var aText = (el.innerText || el.textContent || '').replace(/\\r/g, '').trim();
-        if (!aText || aText.length < 4 || aText.length > 300) continue;
+        if (!aText || aText.length < 5 || aText.length > 300) continue;
+        // Skip junk: pure numbers, single short words
+        if (/^\\d+$/.test(aText)) continue;
         // Skip model selector / dropdown UI text (contains multiple model names)
         var aLower = aText.toLowerCase();
         if ((aLower.includes('gemini') || aLower.includes('claude') || aLower.includes('gpt')) && aLower.includes('send')) continue;
         var isThinking = looksLikeThinking(aText);
         if (isThinking || looksLikeActivityLog(aText) || looksLikeToolOutput(aText)) {
+            // When we find a short activity verb (e.g. "Analyzed" alone), the file
+            // reference may be in a sibling element.  Walk up to the nearest ancestor
+            // (max 3 levels) whose innerText contains the verb AND more context
+            // (e.g. "Analyzed package.json#L1-75").
+            var bestText = aText;
+            if (!isThinking && looksLikeActivityLog(aText) && aText.length < 60) {
+                var ancestor = el.parentElement;
+                for (var up = 0; up < 3 && ancestor && ancestor !== scope; up++) {
+                    // Don't cross into excluded containers
+                    if (ancestor.closest && ancestor.closest('.leading-relaxed, .rendered-markdown, .prose, .animate-markdown, [data-message-role], [data-message-author-role]')) break;
+                    var ancestorText = (ancestor.innerText || ancestor.textContent || '').replace(/\\r/g, '').trim();
+                    // Accept if it still looks like activity, is longer, and not too long
+                    if (ancestorText && ancestorText.length > bestText.length && ancestorText.length <= 300 && looksLikeActivityLog(ancestorText)) {
+                        bestText = ancestorText;
+                        // Mark ancestor as seen to prevent child duplication
+                        actSeen.add(ancestor);
+                    }
+                    ancestor = ancestor.parentElement;
+                }
+            }
             // Ancestor dedup: skip if a parent was already captured as activity
             var dup = false;
             var p = el.parentElement;
@@ -370,10 +395,10 @@ export function extractAssistantSegmentsPayloadScript(): string {
             }
             if (dup) continue;
             actSeen.add(el);
-            var aKind = isThinking ? 'thinking' : (looksLikeToolOutput(aText) ? 'tool-result' : 'tool-call');
+            var aKind = isThinking ? 'thinking' : (looksLikeToolOutput(bestText) ? 'tool-result' : 'tool-call');
             segments.push({
                 kind: aKind,
-                text: aText.slice(0, isThinking ? 2000 : 300),
+                text: bestText.slice(0, isThinking ? 2000 : 300),
                 role: 'assistant',
                 messageIndex: 0,
                 domPath: 'activity-scan:nth(' + ai + ')'

@@ -1,3 +1,5 @@
+import { EventEmitter } from 'events';
+
 import { logger } from '../utils/logger';
 import { extractProjectNameFromPath } from '../utils/pathUtils';
 import { CdpService, CdpServiceOptions } from './cdpService';
@@ -12,8 +14,13 @@ import { UserMessageDetector } from './userMessageDetector';
  * Each workspace owns its own WebSocket / contexts / pendingCalls, so
  * switching to workspace B while workspace A's ResponseMonitor is polling
  * does not destroy A's WebSocket.
+ *
+ * Emits workspace lifecycle events:
+ * - `workspace:disconnected` (projectName: string)
+ * - `workspace:reconnected` (projectName: string)
+ * - `workspace:reconnectFailed` (projectName: string)
  */
-export class CdpConnectionPool {
+export class CdpConnectionPool extends EventEmitter {
     private readonly connections = new Map<string, CdpService>();
     private readonly approvalDetectors = new Map<string, ApprovalDetector>();
     private readonly errorPopupDetectors = new Map<string, ErrorPopupDetector>();
@@ -23,6 +30,7 @@ export class CdpConnectionPool {
     private readonly cdpOptions: CdpServiceOptions;
 
     constructor(cdpOptions: CdpServiceOptions = {}) {
+        super();
         this.cdpOptions = cdpOptions;
     }
 
@@ -243,12 +251,19 @@ export class CdpConnectionPool {
         // Auto-cleanup on disconnect
         cdp.on('disconnected', () => {
             logger.error(`[CdpConnectionPool] Workspace "${projectName}" disconnected`);
+            this.emit('workspace:disconnected', projectName);
             // Only remove from Map when reconnection fails
             // (CdpService attempts reconnection internally, so we don't remove here)
         });
 
+        cdp.on('reconnected', () => {
+            logger.info(`[CdpConnectionPool] Workspace "${projectName}" reconnected`);
+            this.emit('workspace:reconnected', projectName);
+        });
+
         cdp.on('reconnectFailed', () => {
             logger.error(`[CdpConnectionPool] Reconnection failed for workspace "${projectName}". Removing from pool`);
+            this.emit('workspace:reconnectFailed', projectName);
             this.disconnectWorkspace(projectName);
         });
 

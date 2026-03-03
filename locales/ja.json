@@ -42,7 +42,7 @@
   "Allow Chat": "この会話を許可",
   "Deny": "拒否",
   "🖼️ Detected generated images (${files.length})": "🖼️ 生成画像を検出しました (${files.length}件)",
-  "Waiting for output...": "出力を待機中...",
+  "Generating...": "生成中...",
   "🖼️ Attached image fallback": "🖼️ 添付画像のフォールバック",
   "Failed to attach image directly, resending via URL reference.": "画像の直接添付に失敗したため、URL参照形式で再送します。",
   "⏱️ Elapsed: 0s | Waiting to start": "⏱️ 経過時間: 0秒 | 生成開始待ち",

@@ -671,6 +671,8 @@ export class ResponseMonitor {
     private seenThinkingLogKeys: Set<string> = new Set();
     private structuredDiagLogged: boolean = false;
     private lastExtractionSource: 'structured' | 'legacy' | null = null;
+    /** Consecutive WebSocket error count — stops monitor after threshold */
+    private consecutiveWsErrors: number = 0;
 
     constructor(options: ResponseMonitorOptions) {
         this.cdpService = options.cdpService;
@@ -714,6 +716,7 @@ export class ResponseMonitor {
         this.quotaDetected = false;
         this.seenProcessLogKeys = new Set();
         this.seenThinkingLogKeys = new Set();
+        this.consecutiveWsErrors = 0;
 
         this.onPhaseChange?.(this.currentPhase, null);
 
@@ -898,18 +901,14 @@ export class ResponseMonitor {
      * Emit new process log entries, deduplicating against previously seen keys.
      */
     private emitNewProcessLogs(entries: string[]): void {
-        const newEntries: string[] = [];
         for (const line of entries) {
             const normalized = (line || '').replace(/\r/g, '').trim();
             if (!normalized) continue;
             const key = normalized.slice(0, 200);
             if (this.seenProcessLogKeys.has(key)) continue;
             this.seenProcessLogKeys.add(key);
-            newEntries.push(normalized.slice(0, 300));
-        }
-        if (newEntries.length > 0) {
             try {
-                this.onProcessLog?.(newEntries.join('\n\n'));
+                this.onProcessLog?.(normalized.slice(0, 300));
             } catch {
                 // callback error
             }
@@ -920,7 +919,6 @@ export class ResponseMonitor {
      * Emit new thinking log entries, deduplicating against previously seen keys.
      */
     private emitNewThinkingLogs(entries: string[]): void {
-        const newEntries: string[] = [];
         for (const line of entries) {
             const normalized = (line || '').replace(/\r/g, '').trim();
             if (!normalized) continue;
@@ -929,12 +927,9 @@ export class ResponseMonitor {
             this.seenThinkingLogKeys.add(key);
             // Also mark as seen in process logs to prevent cross-contamination
             this.seenProcessLogKeys.add(key);
-            newEntries.push(normalized.slice(0, 2000));
-        }
-        if (newEntries.length > 0) {
-            logger.debug('[ResponseMonitor] Emitting', newEntries.length, 'new thinking entries');
+            logger.debug('[ResponseMonitor] Emitting thinking entry:', normalized.slice(0, 80));
             try {
-                this.onThinkingLog?.(newEntries.join('\n\n'));
+                this.onThinkingLog?.(normalized.slice(0, 2000));
             } catch {
                 // callback error
             }
@@ -1032,6 +1027,9 @@ export class ResponseMonitor {
                 }
             }
 
+            // CDP calls succeeded — reset WebSocket error counter
+            this.consecutiveWsErrors = 0;
+
             // Handle stop button appearing
             if (isGenerating) {
                 if (!this.generationStarted) {
@@ -1107,7 +1105,18 @@ export class ResponseMonitor {
             }
         } catch (error) {
             const msg = error instanceof Error ? error.message : String(error);
-            if (msg.includes('WebSocket is not connected') || msg.includes('WebSocket disconnected')) return;
+            if (msg.includes('WebSocket is not connected') || msg.includes('WebSocket disconnected')) {
+                this.consecutiveWsErrors++;
+                if (this.consecutiveWsErrors >= 5) {
+                    logger.error(`[ResponseMonitor] ${this.consecutiveWsErrors} consecutive WebSocket errors — stopping monitor`);
+                    const lastText = this.lastText ?? '';
+                    await this.stop();
+                    try {
+                        await Promise.resolve(this.onTimeout?.(lastText));
+                    } catch { /* callback error */ }
+                }
+                return;
+            }
             logger.error('[ResponseMonitor] poll error:', error);
         }
     }

@@ -18,7 +18,7 @@
   "Allow Chat": "Allow This Conversation",
   "Deny": "Deny",
   "🖼️ Detected generated images (${files.length})": "🖼️ Detected generated images (${files.length})",
-  "Waiting for output...": "Waiting for output...",
+  "Generating...": "Generating...",
   "🖼️ Attached image fallback": "🖼️ Attached image fallback",
   "Failed to attach image directly, resending via URL reference.": "Failed to attach image directly, resending via URL reference.",
   "⏱️ Elapsed: 0s | Waiting to start": "⏱️ Elapsed: 0s | Waiting to start",

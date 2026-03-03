@@ -40,9 +40,10 @@ import {
     parseErrorPopupCustomId,
     parsePlanningCustomId,
 } from '../services/cdpBridgeManager';
-import { buildModeModelLines, fitForSingleEmbedDescription, splitForEmbedDescription } from '../utils/streamMessageFormatter';
+import { classifyAssistantSegments, extractAssistantSegmentsPayloadScript } from '../services/assistantDomExtractor';
+import { buildModeModelLines, splitForEmbedDescription } from '../utils/streamMessageFormatter';
 import { formatForTelegram, splitOutputAndLogs, escapeHtml, splitTelegramHtml } from '../utils/telegramFormatter';
-import { ProcessLogBuffer } from '../utils/processLogBuffer';
+// ProcessLogBuffer no longer used — progress display uses ordered event stream
 import {
     buildPromptWithAttachmentUrls,
     cleanupInboundImageAttachments,
@@ -98,7 +99,7 @@ function stripHtmlForFile(html: string): string {
     // Links
     text = text.replace(/<a\s+href="([^"]*)">([\s\S]*?)<\/a>/gi, '[$2]($1)');
     // Blockquotes
-    text = text.replace(/<blockquote>([\s\S]*?)<\/blockquote>/gi, (_m, content) =>
+    text = text.replace(/<blockquote[^>]*>([\s\S]*?)<\/blockquote>/gi, (_m, content) =>
         content.split('\n').map((l: string) => `> ${l}`).join('\n'),
     );
     // Strip remaining tags
@@ -193,7 +194,9 @@ async function sendPromptToAntigravity(
     /** Send a potentially long response, splitting into chunks and attaching a .md file if needed. */
     const sendChunkedResponse = async (title: string, footer: string, rawBody: string, isAlreadyHtml: boolean): Promise<void> => {
         const formattedBody = isAlreadyHtml ? rawBody : formatForTelegram(rawBody);
-        const fullMsg = `<b>${escapeHtml(title)}</b>\n\n${formattedBody}\n\n<i>${escapeHtml(footer)}</i>`;
+        const titleLine = title ? `<b>${escapeHtml(title)}</b>\n\n` : '';
+        const footerLine = footer ? `\n\n<i>${escapeHtml(footer)}</i>` : '';
+        const fullMsg = `${titleLine}${formattedBody}${footerLine}`;
 
         if (fullMsg.length <= TELEGRAM_MSG_LIMIT) {
             await upsertLiveResponse(title, rawBody, footer, { expectedVersion: liveResponseUpdateVersion, isAlreadyHtml, skipTruncation: true });
@@ -208,9 +211,11 @@ async function sendPromptToAntigravity(
         for (let pi = 0; pi < inlineCount; pi++) {
             const partLabel = hasFile ? `(${pi + 1}/${inlineCount}+file)` : `(${pi + 1}/${total})`;
             if (pi === 0) {
-                await upsertLiveResponse(`${title} ${partLabel}`, bodyChunks[pi], footer, { expectedVersion: liveResponseUpdateVersion, isAlreadyHtml: true, skipTruncation: true });
+                const firstTitle = title ? `${title} ${partLabel}` : partLabel;
+                await upsertLiveResponse(firstTitle, bodyChunks[pi], footer, { expectedVersion: liveResponseUpdateVersion, isAlreadyHtml: true, skipTruncation: true });
             } else {
-                await sendMsg(`${bodyChunks[pi]}\n\n<i>${escapeHtml(footer)} ${partLabel}</i>`);
+                const partFooter = footer ? `${escapeHtml(footer)} ${partLabel}` : partLabel;
+                await sendMsg(`${bodyChunks[pi]}\n\n<i>${partFooter}</i>`);
             }
         }
 
@@ -238,68 +243,105 @@ async function sendPromptToAntigravity(
     const localMode = modeService.getCurrentMode();
     const modeName = MODE_UI_NAMES[localMode] || localMode;
     const currentModel = (await cdp.getCurrentModel()) || modelService.getCurrentModel();
+    const modelLabel = `${currentModel}`;
 
-    await sendEmbed(
-        `${PHASE_ICONS.sending} [${modeName} - ${currentModel}] Sending...`,
-        buildModeModelLines(modeName, currentModel, currentModel).join('\n'),
-    );
+    // Initialize live progress message (replaces separate "Sending" embed)
+    let liveActivityMsgId: number | null = null;
+    try {
+        const sendingText = `<b>${PHASE_ICONS.sending} ${escapeHtml(modeName)} · ${escapeHtml(modelLabel)}</b>\n\n<i>Sending...</i>`;
+        const sendingMsg = await api.sendMessage(channel.chatId, sendingText, { parse_mode: 'HTML', message_thread_id: channel.threadId });
+        liveActivityMsgId = sendingMsg.message_id;
+    } catch (e) { logger.error('[sendPrompt] Failed to send initial status:', e); }
 
     let isFinalized = false;
     let elapsedTimer: ReturnType<typeof setInterval> | null = null;
     let lastProgressText = '';
-    let lastActivityLogText = '';
-    let lastThinkingLogText = '';
     const LIVE_RESPONSE_MAX_LEN = 3800;
-    const LIVE_ACTIVITY_MAX_LEN = 3800;
-    const THINKING_BUDGET = 1500;
-    const ACTIVITY_BUDGET = 2300;
-    const processLogBuffer = new ProcessLogBuffer({ maxChars: LIVE_ACTIVITY_MAX_LEN, maxEntries: 120, maxEntryLength: 220 });
+    const MAX_PROGRESS_BODY = 3500;
+    const MAX_PROGRESS_ENTRIES = 60;
     let liveResponseMsgId: number | null = null;
-    let liveActivityMsgId: number | null = null;
     let lastLiveResponseKey = '';
     let lastLiveActivityKey = '';
     let liveResponseUpdateVersion = 0;
     let liveActivityUpdateVersion = 0;
 
-    const ACTIVITY_PLACEHOLDER = t('Collecting process logs...');
+    // --- Ordered progress event stream ---
+    interface ProgressEntry { kind: 'thought' | 'thought-content' | 'activity'; text: string; }
+    const progressLog: ProgressEntry[] = [];
+    let thinkingActive = false;
+    const thinkingContentParts: string[] = [];
+    let lastThoughtLabel = '';
+
+    /** Check if text is junk (numbers, very short, not meaningful) */
+    const isJunkEntry = (text: string): boolean => {
+        const t = text.trim();
+        if (t.length < 5) return true;
+        if (/^\d+$/.test(t)) return true;
+        // Single word under 8 chars without context (e.g. "Analyzed" alone)
+        if (!/\s/.test(t) && t.length < 8) return true;
+        return false;
+    };
+
+    /** Format a single activity line — collapse multi-line text into one line */
+    const formatActivityLine = (raw: string): string => {
+        // Collapse newlines into spaces so file references after verbs aren't lost
+        // e.g. "Analyzed\npackage.json#L1-75" → "Analyzed package.json#L1-75"
+        const collapsed = (raw || '').replace(/\n+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        if (!collapsed || isJunkEntry(collapsed)) return '';
+        return escapeHtml(collapsed.slice(0, 120));
+    };
+
+    /** Trim progress log to stay within size limits */
+    const trimProgressLog = (): void => {
+        while (progressLog.length > MAX_PROGRESS_ENTRIES) progressLog.shift();
+    };
+
+    /** Build the progress message body from the ordered event stream */
+    const buildProgressBody = (): string => {
+        const lines: string[] = [];
+        for (const e of progressLog) {
+            switch (e.kind) {
+                case 'thought':
+                    lines.push(`💭 <i>${escapeHtml(e.text)}</i>`);
+                    break;
+                case 'thought-content':
+                    lines.push(`<i>${escapeHtml(e.text)}</i>`);
+                    break;
+                case 'activity':
+                    lines.push(e.text); // already HTML-escaped
+                    break;
+            }
+        }
+        if (thinkingActive) {
+            lines.push('💭 <i>Thinking...</i>');
+        }
+        // Use \n\n for spacing between entries (like Antigravity's line gap)
+        let body = lines.join('\n\n');
+        // Trim from beginning if too long, keeping most recent events
+        if (body.length > MAX_PROGRESS_BODY) {
+            body = '...\n\n' + body.slice(-MAX_PROGRESS_BODY + 5);
+        }
+        return body || '<i>Generating...</i>';
+    };
+
+    /** Build full progress message with title + body + footer */
+    const buildProgressMessage = (title: string, footer: string): string => {
+        const body = buildProgressBody();
+        const footerLine = footer ? `\n\n<i>${escapeHtml(footer)}</i>` : '';
+        return `<b>${escapeHtml(title)}</b>\n\n${body}${footerLine}`;
+    };
 
     const buildLiveResponseText = (title: string, rawText: string, footer: string, isAlreadyHtml = false, skipTruncation = false): string => {
         const normalized = (rawText || '').trim();
         const body = normalized
             ? (isAlreadyHtml ? normalized : formatForTelegram(normalized))
-            : t('Waiting for output...');
+            : t('Generating...');
         const truncated = (!skipTruncation && body.length > LIVE_RESPONSE_MAX_LEN)
             ? '...(beginning truncated)\n' + body.slice(-LIVE_RESPONSE_MAX_LEN + 30)
             : body;
-        return `<b>${escapeHtml(title)}</b>\n\n${truncated}\n\n<i>${escapeHtml(footer)}</i>`;
-    };
-
-    const buildLiveActivityText = (title: string, rawText: string, footer: string): string => {
-        const normalized = (rawText || '').trim();
-        const thinkingNormalized = (lastThinkingLogText || '').trim();
-        const hasThinking = thinkingNormalized.length > 10;
-
-        let body: string;
-        if (hasThinking) {
-            const thinkingTruncated = thinkingNormalized.length > THINKING_BUDGET
-                ? '...' + thinkingNormalized.slice(-THINKING_BUDGET + 3)
-                : thinkingNormalized;
-            const activityBody = normalized
-                ? fitForSingleEmbedDescription(formatForTelegram(normalized), ACTIVITY_BUDGET)
-                : ACTIVITY_PLACEHOLDER;
-            body = `\u{1F9E0} <b>AI Thinking</b>\n<blockquote>${escapeHtml(thinkingTruncated)}</blockquote>\n\n\u{1F4CB} <b>Activity</b>\n${activityBody}`;
-        } else {
-            body = normalized
-                ? fitForSingleEmbedDescription(formatForTelegram(normalized), LIVE_ACTIVITY_MAX_LEN)
-                : ACTIVITY_PLACEHOLDER;
-        }
-        return `<b>${escapeHtml(title)}</b>\n\n${body}\n\n<i>${escapeHtml(footer)}</i>`;
-    };
-
-    const appendProcessLogs = (text: string): string => {
-        const normalized = (text || '').trim();
-        if (!normalized) return processLogBuffer.snapshot();
-        return processLogBuffer.append(normalized);
+        const titleLine = title ? `<b>${escapeHtml(title)}</b>\n\n` : '';
+        const footerLine = footer ? `\n\n<i>${escapeHtml(footer)}</i>` : '';
+        return `${titleLine}${truncated}${footerLine}`;
     };
 
     const upsertLiveResponse = (title: string, rawText: string, footer: string, opts?: { expectedVersion?: number; skipWhenFinalized?: boolean; isAlreadyHtml?: boolean; skipTruncation?: boolean }): Promise<void> =>
@@ -318,19 +360,33 @@ async function sendPromptToAntigravity(
             }
         }, 'upsert-response');
 
-    const upsertLiveActivity = (title: string, rawText: string, footer: string, opts?: { expectedVersion?: number; skipWhenFinalized?: boolean }): Promise<void> =>
+    /** Refresh progress message using the ordered event stream */
+    const refreshProgress = (title: string, footer: string, opts?: { expectedVersion?: number; skipWhenFinalized?: boolean }): Promise<void> =>
         enqueueActivity(async () => {
             if (opts?.skipWhenFinalized && isFinalized) return;
             if (opts?.expectedVersion !== undefined && opts.expectedVersion !== liveActivityUpdateVersion) return;
-            const text = buildLiveActivityText(title, rawText, footer);
-            const renderKey = `${title}|${rawText.slice(0, 200)}|${footer}`;
-            if (renderKey === lastLiveActivityKey && liveActivityMsgId) return;
-            lastLiveActivityKey = renderKey;
+            const text = buildProgressMessage(title, footer);
+            // Use progress body hash for dedup
+            const bodySnap = progressLog.length + '|' + thinkingActive + '|' + title + '|' + footer;
+            if (bodySnap === lastLiveActivityKey && liveActivityMsgId) return;
+            lastLiveActivityKey = bodySnap;
 
             if (liveActivityMsgId) {
                 await editMsg(liveActivityMsgId, text);
             } else {
                 liveActivityMsgId = await sendMsg(text);
+            }
+        }, 'upsert-activity');
+
+    /** Direct message update for special cases (completion, quota, timeout) */
+    const setProgressMessage = (htmlContent: string, opts?: { expectedVersion?: number }): Promise<void> =>
+        enqueueActivity(async () => {
+            if (opts?.expectedVersion !== undefined && opts.expectedVersion !== liveActivityUpdateVersion) return;
+            lastLiveActivityKey = htmlContent.slice(0, 200);
+            if (liveActivityMsgId) {
+                await editMsg(liveActivityMsgId, htmlContent);
+            } else {
+                liveActivityMsgId = await sendMsg(htmlContent);
             }
         }, 'upsert-activity');
 
@@ -398,7 +454,17 @@ async function sendPromptToAntigravity(
         }
 
         const startTime = Date.now();
-        await upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, '', t('⏱️ Elapsed: 0s | Process log'));
+        const progressTitle = () => `${PHASE_ICONS.thinking} ${modelLabel}`;
+        const progressFooter = () => `⏱️ ${Math.round((Date.now() - startTime) / 1000)}s`;
+
+        /** Trigger a progress message refresh */
+        const triggerProgressRefresh = (): void => {
+            liveActivityUpdateVersion += 1;
+            const v = liveActivityUpdateVersion;
+            refreshProgress(progressTitle(), progressFooter(), { expectedVersion: v, skipWhenFinalized: true }).catch(() => { });
+        };
+
+        await refreshProgress(progressTitle(), progressFooter());
 
         monitor = new ResponseMonitor({
             cdpService: cdp,
@@ -408,25 +474,56 @@ async function sendPromptToAntigravity(
             onPhaseChange: () => { },
             onProcessLog: (logText) => {
                 if (isFinalized) return;
-                if (logText && logText.trim().length > 0) lastActivityLogText = appendProcessLogs(logText);
-                const elapsed = Math.round((Date.now() - startTime) / 1000);
-                liveActivityUpdateVersion += 1;
-                const v = liveActivityUpdateVersion;
-                upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, lastActivityLogText || ACTIVITY_PLACEHOLDER, t(`⏱️ Elapsed: ${elapsed}s | Process log`), { expectedVersion: v, skipWhenFinalized: true }).catch(() => { });
+                const trimmed = (logText || '').trim();
+                if (!trimmed || isJunkEntry(trimmed)) return;
+                const formatted = formatActivityLine(trimmed);
+                if (formatted) {
+                    progressLog.push({ kind: 'activity', text: formatted });
+                    trimProgressLog();
+                    triggerProgressRefresh();
+                }
             },
             onThinkingLog: (thinkingText) => {
                 if (isFinalized) return;
-                logger.debug('[Bot] onThinkingLog received:', (thinkingText || '').slice(0, 100));
-                if (thinkingText && thinkingText.trim().length > 0) {
-                    lastThinkingLogText = lastThinkingLogText
-                        ? lastThinkingLogText + '\n' + thinkingText.trim()
-                        : thinkingText.trim();
-                    logger.debug('[Bot] lastThinkingLogText now:', lastThinkingLogText.length, 'chars');
+                const trimmed = (thinkingText || '').trim();
+                if (!trimmed) return;
+                logger.debug('[Bot] onThinkingLog received:', trimmed.slice(0, 100));
+
+                const stripped = trimmed.replace(/^[^a-zA-Z]+/, '');
+
+                if (/^thinking\.{0,3}$/i.test(stripped)) {
+                    // Transient "Thinking..." — just set flag, don't add entry
+                    thinkingActive = true;
+                } else if (/^thought for\s/i.test(stripped)) {
+                    // Completed thinking cycle: "Thought for 1s"
+                    thinkingActive = false;
+                    lastThoughtLabel = trimmed;
+                    progressLog.push({ kind: 'thought', text: trimmed });
+                    trimProgressLog();
+                } else {
+                    // Thinking content — merge as summary with most recent 'thought' entry
+                    thinkingContentParts.push(trimmed);
+                    const firstLine = trimmed.split('\n')[0].trim();
+                    const heading = firstLine.length > 60 ? firstLine.slice(0, 57) + '...' : firstLine;
+                    // Find most recent thought entry that doesn't yet have content attached
+                    let merged = false;
+                    for (let i = progressLog.length - 1; i >= 0; i--) {
+                        if (progressLog[i].kind === 'thought') {
+                            // Only merge if no content heading attached yet (no " — ")
+                            if (!progressLog[i].text.includes(' — ')) {
+                                progressLog[i].text += ` — ${heading}`;
+                                merged = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (!merged && heading.length > 10) {
+                        // No thought label to merge into — show as standalone content
+                        progressLog.push({ kind: 'thought-content', text: heading });
+                        trimProgressLog();
+                    }
                 }
-                const elapsed = Math.round((Date.now() - startTime) / 1000);
-                liveActivityUpdateVersion += 1;
-                const v = liveActivityUpdateVersion;
-                upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, lastActivityLogText || ACTIVITY_PLACEHOLDER, t(`⏱️ Elapsed: ${elapsed}s | Process log`), { expectedVersion: v, skipWhenFinalized: true }).catch(() => { });
+                triggerProgressRefresh();
             },
             onProgress: (text) => {
                 if (isFinalized) return;
@@ -450,11 +547,11 @@ async function sendPromptToAntigravity(
                     const isQuotaError = monitor!.getPhase() === 'quotaReached' || monitor!.getQuotaDetected();
 
                     if (isQuotaError) {
-                        const finalLogText = lastActivityLogText || processLogBuffer.snapshot();
                         liveActivityUpdateVersion += 1;
-                        await upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, finalLogText || ACTIVITY_PLACEHOLDER, t(`⏱️ Time: ${elapsed}s | Process log`), { expectedVersion: liveActivityUpdateVersion });
+                        thinkingActive = false;
+                        await setProgressMessage(`<b>⚠️ ${escapeHtml(modelLabel)} · Quota Reached</b>\n\n${buildProgressBody()}\n\n<i>⏱️ ${elapsed}s</i>`, { expectedVersion: liveActivityUpdateVersion });
                         liveResponseUpdateVersion += 1;
-                        await upsertLiveResponse('⚠️ Model Quota Reached', 'Model quota limit reached. Please wait or switch to a different model.', t(`⏱️ Time: ${elapsed}s | Quota Reached`), { expectedVersion: liveResponseUpdateVersion });
+                        await upsertLiveResponse('⚠️ Quota Reached', 'Model quota limit reached. Please wait or switch to a different model.', `⏱️ ${elapsed}s`, { expectedVersion: liveResponseUpdateVersion });
 
                         try {
                             const payload = await buildModelsUI(cdp, () => bridge.quota.fetchQuota());
@@ -465,34 +562,130 @@ async function sendPromptToAntigravity(
                         return;
                     }
 
-                    const responseText = (finalText && finalText.trim().length > 0) ? finalText : lastProgressText;
-                    const emergencyText = (!responseText || responseText.trim().length === 0) ? await tryEmergencyExtractText() : '';
-                    const finalResponseText = responseText && responseText.trim().length > 0 ? responseText : emergencyText;
-                    const isAlreadyHtml = meta?.source === 'structured';
+                    // Fresh DOM re-extraction at completion time to ensure we get the
+                    // complete response — polling may have captured partial/stale text.
+                    let freshText = '';
+                    let freshIsHtml = false;
+                    try {
+                        const contextId = cdp.getPrimaryContextId();
+                        const evalParams: Record<string, unknown> = {
+                            expression: extractAssistantSegmentsPayloadScript(),
+                            returnByValue: true,
+                            awaitPromise: true,
+                        };
+                        if (contextId !== null && contextId !== undefined) evalParams.contextId = contextId;
+                        const freshResult = await cdp.call('Runtime.evaluate', evalParams);
+                        const freshClassified = classifyAssistantSegments(freshResult?.result?.value);
+                        if (freshClassified.diagnostics.source === 'dom-structured' && freshClassified.finalOutputText.trim()) {
+                            freshText = freshClassified.finalOutputText.trim();
+                            freshIsHtml = true;
+                        }
+                    } catch (e) { logger.debug('[onComplete] Fresh structured extraction failed:', e); }
+
+                    // Pick the best text: fresh extraction > polled finalText > lastProgressText > emergency
+                    const polledText = (finalText && finalText.trim().length > 0) ? finalText : lastProgressText;
+                    const bestPolled = polledText && polledText.trim().length > 0 ? polledText : '';
+                    // Prefer the fresh extraction if it's at least as long (more complete)
+                    let finalResponseText: string;
+                    let isAlreadyHtml: boolean;
+                    if (freshText && freshText.length >= bestPolled.length) {
+                        finalResponseText = freshText;
+                        isAlreadyHtml = freshIsHtml;
+                    } else if (bestPolled) {
+                        finalResponseText = bestPolled;
+                        isAlreadyHtml = meta?.source === 'structured';
+                    } else {
+                        const emergencyText = await tryEmergencyExtractText();
+                        finalResponseText = emergencyText;
+                        isAlreadyHtml = false;
+                    }
                     const separated = isAlreadyHtml ? { output: finalResponseText, logs: '' } : splitOutputAndLogs(finalResponseText);
                     const finalOutputText = separated.output || finalResponseText;
-                    const finalLogText = lastActivityLogText || processLogBuffer.snapshot();
 
-                    if (finalLogText && finalLogText.trim().length > 0) {
-                        logger.divider('Process Log');
-                        console.info(finalLogText);
-                    }
+                    // Send collapsible thinking block as a separate message before the response.
+                    // Extract both label and content directly from DOM at completion time,
+                    // so we don't depend on polling (2s interval) having captured thinking events.
+                    try {
+                        const thinkExtract = await cdp.call('Runtime.evaluate', {
+                            expression: `(function() {
+                                var panel = document.querySelector('.antigravity-agent-side-panel');
+                                var scope = panel || document;
+                                var details = scope.querySelectorAll('details');
+                                var blocks = [];
+                                for (var i = 0; i < details.length; i++) {
+                                    var d = details[i];
+                                    var summary = d.querySelector('summary');
+                                    if (!summary) continue;
+                                    var rawLabel = (summary.textContent || '').trim();
+                                    var stripped = rawLabel.replace(/^[^a-zA-Z]+/, '');
+                                    if (!/^(?:thought for|thinking)\\b/i.test(stripped)) continue;
+                                    var wasOpen = d.open;
+                                    if (!wasOpen) d.open = true;
+                                    // Try children first, then fall back to full textContent minus summary
+                                    var children = d.children;
+                                    var parts = [];
+                                    for (var c = 0; c < children.length; c++) {
+                                        if (children[c].tagName === 'SUMMARY' || children[c].tagName === 'STYLE') continue;
+                                        var t = (children[c].innerText || children[c].textContent || '').trim();
+                                        if (t && t.length >= 5) parts.push(t);
+                                    }
+                                    // Fallback: use detail's full text minus the summary text
+                                    if (parts.length === 0) {
+                                        var fullText = (d.innerText || d.textContent || '').trim();
+                                        var bodyText = fullText.replace(rawLabel, '').trim();
+                                        if (bodyText && bodyText.length >= 5) parts.push(bodyText);
+                                    }
+                                    if (!wasOpen) d.open = false;
+                                    blocks.push({ label: rawLabel, body: parts.join('\\n\\n') });
+                                }
+                                return blocks;
+                            })()`,
+                            returnByValue: true,
+                        });
+                        const thinkBlocks: Array<{ label: string; body: string }> = Array.isArray(thinkExtract?.result?.value) ? thinkExtract.result.value : [];
+                        if (thinkBlocks.length > 0) {
+                            // Also incorporate poll-accumulated content if available
+                            const accumulatedBody = thinkingContentParts.join('\n\n');
+                            // Build combined thinking message — merge all blocks
+                            const sections: string[] = [];
+                            for (const block of thinkBlocks) {
+                                const label = block.label || lastThoughtLabel || 'Thinking';
+                                const body = block.body || accumulatedBody || '';
+                                if (body) {
+                                    sections.push(`  💭 <b>${escapeHtml(label)}</b>\n\n<i>${escapeHtml(body)}</i>`);
+                                } else {
+                                    sections.push(`  💭 <b>${escapeHtml(label)}</b>`);
+                                }
+                            }
+                            const combined = sections.join('\n\n');
+                            const maxThinkLen = TELEGRAM_MSG_LIMIT - 100;
+                            const trimmed = combined.length > maxThinkLen ? combined.slice(0, maxThinkLen) + '...' : combined;
+                            const thinkMsg = `<blockquote expandable>${trimmed}</blockquote>`;
+                            logger.info(`[Bot] Sending thinking block: ${thinkBlocks.length} block(s), ${combined.length} chars`);
+                            await sendMsg(thinkMsg);
+                        } else {
+                            logger.info('[Bot] No thinking blocks found in DOM at completion time');
+                        }
+                    } catch (e) { logger.error('[Bot] Failed to send thinking block:', e); }
+
                     if (finalOutputText && finalOutputText.trim().length > 0) {
                         logger.divider(`Output (${finalOutputText.length} chars)`);
                         console.info(finalOutputText);
                     }
                     logger.divider();
 
+                    // Compact progress message: show completed title + event log
                     liveActivityUpdateVersion += 1;
-                    await upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, finalLogText || ACTIVITY_PLACEHOLDER, t(`⏱️ Time: ${elapsed}s | Process log`), { expectedVersion: liveActivityUpdateVersion });
+                    thinkingActive = false;
+                    const completedBody = buildProgressBody();
+                    await setProgressMessage(`<b>${PHASE_ICONS.complete} ${escapeHtml(modelLabel)} · ${elapsed}s</b>\n\n${completedBody}`, { expectedVersion: liveActivityUpdateVersion });
 
                     liveResponseUpdateVersion += 1;
                     if (finalOutputText && finalOutputText.trim().length > 0) {
-                        const title = `${PHASE_ICONS.complete} Final Output`;
-                        const footer = t(`⏱️ Time: ${elapsed}s | Complete`);
-                        await sendChunkedResponse(title, footer, finalOutputText, isAlreadyHtml);
+                        const footer = `⏱️ ${elapsed}s`;
+                        await sendChunkedResponse('', footer, finalOutputText, isAlreadyHtml);
                     } else {
-                        await upsertLiveResponse(`${PHASE_ICONS.complete} Complete`, t('Failed to extract response. Use /screenshot to verify.'), t(`⏱️ Time: ${elapsed}s | Complete`), { expectedVersion: liveResponseUpdateVersion });
+                        await upsertLiveResponse(`${PHASE_ICONS.complete} Complete`, t('Failed to extract response. Use /screenshot to verify.'), `⏱️ ${elapsed}s`, { expectedVersion: liveResponseUpdateVersion });
                     }
 
                     if (options) {
@@ -537,17 +730,15 @@ async function sendPromptToAntigravity(
                     const timeoutText = (lastText && lastText.trim().length > 0) ? lastText : lastProgressText;
                     const timeoutIsHtml = monitor!.getLastExtractionSource() === 'structured';
                     const separated = timeoutIsHtml ? { output: timeoutText || '', logs: '' } : splitOutputAndLogs(timeoutText || '');
-                    const sanitizedTimeoutLogs = lastActivityLogText || processLogBuffer.snapshot();
                     const payload = separated.output && separated.output.trim().length > 0
                         ? `${separated.output}\n\n[Monitor Ended] Timeout after 30 minutes.`
                         : 'Monitor ended after 30 minutes. No text was retrieved.';
 
                     liveResponseUpdateVersion += 1;
-                    const timeoutTitle = `${PHASE_ICONS.timeout} Timeout`;
-                    const timeoutFooter = `⏱️ Elapsed: ${elapsed}s | Timeout`;
-                    await sendChunkedResponse(timeoutTitle, timeoutFooter, payload, timeoutIsHtml);
+                    await sendChunkedResponse(`${PHASE_ICONS.timeout} Timeout`, `⏱️ ${elapsed}s`, payload, timeoutIsHtml);
                     liveActivityUpdateVersion += 1;
-                    await upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, sanitizedTimeoutLogs || ACTIVITY_PLACEHOLDER, t(`⏱️ Time: ${elapsed}s | Process log`), { expectedVersion: liveActivityUpdateVersion });
+                    thinkingActive = false;
+                    await setProgressMessage(`<b>${PHASE_ICONS.timeout} ${escapeHtml(modelLabel)} · ${elapsed}s</b>\n\n${buildProgressBody()}`, { expectedVersion: liveActivityUpdateVersion });
                 } catch (error) { logger.error(`[sendPrompt:${monitorTraceId}] onTimeout failed:`, error); }
             },
         });
@@ -556,10 +747,7 @@ async function sendPromptToAntigravity(
 
         elapsedTimer = setInterval(() => {
             if (isFinalized) { clearInterval(elapsedTimer!); return; }
-            const elapsed = Math.round((Date.now() - startTime) / 1000);
-            liveActivityUpdateVersion += 1;
-            const v = liveActivityUpdateVersion;
-            upsertLiveActivity(`${PHASE_ICONS.thinking} Process Log`, lastActivityLogText || ACTIVITY_PLACEHOLDER, t(`⏱️ Elapsed: ${elapsed}s | Process log`), { expectedVersion: v, skipWhenFinalized: true }).catch(() => { });
+            triggerProgressRefresh();
         }, 5000);
 
     } catch (e: any) {
@@ -608,6 +796,34 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
     const bot = new Bot(config.telegramBotToken);
     bridge.botApi = bot.api;
+
+    // Notify user on WebSocket connection lifecycle events
+    bridge.pool.on('workspace:disconnected', (projectName: string) => {
+        const channel = bridge.lastActiveChannel;
+        if (!channel || !bridge.botApi) return;
+        bridge.botApi.sendMessage(channel.chatId, `⚠️ <b>${escapeHtml(projectName)}</b>: Connection lost. Reconnecting…`, {
+            parse_mode: 'HTML',
+            message_thread_id: channel.threadId,
+        }).catch((err) => logger.error('[Bot] Failed to send disconnect notification:', err));
+    });
+
+    bridge.pool.on('workspace:reconnected', (projectName: string) => {
+        const channel = bridge.lastActiveChannel;
+        if (!channel || !bridge.botApi) return;
+        bridge.botApi.sendMessage(channel.chatId, `✅ <b>${escapeHtml(projectName)}</b>: Reconnected.`, {
+            parse_mode: 'HTML',
+            message_thread_id: channel.threadId,
+        }).catch((err) => logger.error('[Bot] Failed to send reconnect notification:', err));
+    });
+
+    bridge.pool.on('workspace:reconnectFailed', (projectName: string) => {
+        const channel = bridge.lastActiveChannel;
+        if (!channel || !bridge.botApi) return;
+        bridge.botApi.sendMessage(channel.chatId, `❌ <b>${escapeHtml(projectName)}</b>: Reconnection failed. Send a message to retry.`, {
+            parse_mode: 'HTML',
+            message_thread_id: channel.threadId,
+        }).catch((err) => logger.error('[Bot] Failed to send reconnect-failed notification:', err));
+    });
 
     const topicManager = new TelegramTopicManager(bot.api, 0);
 
@@ -710,17 +926,20 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
     // /model command
     bot.command('model', async (ctx) => {
+        const ch = getChannel(ctx);
+        const resolved = await resolveWorkspaceAndCdp(ch);
+        const getCdp = (): CdpService | null => resolved?.cdp ?? getCurrentCdp(bridge);
         const modelName = ctx.match?.trim();
         if (modelName) {
-            const cdp = getCurrentCdp(bridge);
-            if (!cdp) { await ctx.reply('Not connected to CDP.'); return; }
+            const cdp = getCdp();
+            if (!cdp) { await ctx.reply('Not connected to CDP. Send a message first to connect.'); return; }
             const res = await cdp.setUiModel(modelName);
             if (res.ok) { await ctx.reply(`Model changed to <b>${escapeHtml(res.model || modelName)}</b>.`, { parse_mode: 'HTML' }); }
             else { await ctx.reply(res.error || 'Failed to change model.'); }
         } else {
             await sendModelsUI(
                 async (text, keyboard) => { await replyHtml(ctx, text, keyboard); },
-                { getCurrentCdp: () => getCurrentCdp(bridge), fetchQuota: async () => bridge.quota.fetchQuota() },
+                { getCurrentCdp: getCdp, fetchQuota: async () => bridge.quota.fetchQuota() },
             );
         }
     });
