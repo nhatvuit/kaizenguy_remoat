@@ -19,6 +19,7 @@ export interface PersistedConfig {
     logLevel?: LogLevel;
     extractionMode?: 'legacy' | 'structured';
     useTopics?: boolean;
+    disableProgressLog?: boolean;
 }
 
 function getConfigDir(): string {
@@ -86,6 +87,12 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         true,
     );
 
+    const disableProgressLog = resolveBoolean(
+        process.env.DISABLE_PROGRESS_LOG,
+        persisted.disableProgressLog,
+        false,
+    );
+
     return {
         telegramBotToken: token,
         allowedUserIds,
@@ -94,6 +101,7 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         logLevel,
         extractionMode,
         useTopics,
+        disableProgressLog,
     };
 }
 

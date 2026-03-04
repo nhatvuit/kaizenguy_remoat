@@ -168,7 +168,23 @@ async function sendPromptToAntigravity(
                 message_thread_id: channel.threadId,
             });
             return msg.message_id;
-        } catch (e) {
+        } catch (e: any) {
+            // [KaizenGuy] Fallback: if HTML parse fails, retry with plain text
+            const desc = e?.description || e?.message || '';
+            if (desc.includes("can't parse entities") || desc.includes('parse entities')) {
+                logger.warn('[sendMsg] HTML parse failed, retrying as plain text');
+                try {
+                    const plain = text.replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+                    const truncated = plain.length > TELEGRAM_MSG_LIMIT ? plain.slice(0, TELEGRAM_MSG_LIMIT - 20) + '\n...(truncated)' : plain;
+                    const msg = await api.sendMessage(channel.chatId, truncated, {
+                        message_thread_id: channel.threadId,
+                    });
+                    return msg.message_id;
+                } catch (e2) {
+                    logger.error('[sendMsg] Plain text fallback also failed:', e2);
+                    return null;
+                }
+            }
             logger.error('[sendMsg] Failed:', e);
             return null;
         }
@@ -245,13 +261,19 @@ async function sendPromptToAntigravity(
     const currentModel = (await cdp.getCurrentModel()) || modelService.getCurrentModel();
     const modelLabel = `${currentModel}`;
 
+    // [KaizenGuy] Read disableProgressLog config
+    const appConfig = loadConfig();
+    const skipProgress = appConfig.disableProgressLog;
+
     // Initialize live progress message (replaces separate "Sending" embed)
     let liveActivityMsgId: number | null = null;
-    try {
-        const sendingText = `<b>${PHASE_ICONS.sending} ${escapeHtml(modeName)} · ${escapeHtml(modelLabel)}</b>\n\n<i>Sending...</i>`;
-        const sendingMsg = await api.sendMessage(channel.chatId, sendingText, { parse_mode: 'HTML', message_thread_id: channel.threadId });
-        liveActivityMsgId = sendingMsg.message_id;
-    } catch (e) { logger.error('[sendPrompt] Failed to send initial status:', e); }
+    if (!skipProgress) {
+        try {
+            const sendingText = `<b>${PHASE_ICONS.sending} ${escapeHtml(modeName)} · ${escapeHtml(modelLabel)}</b>\n\n<i>Sending...</i>`;
+            const sendingMsg = await api.sendMessage(channel.chatId, sendingText, { parse_mode: 'HTML', message_thread_id: channel.threadId });
+            liveActivityMsgId = sendingMsg.message_id;
+        } catch (e) { logger.error('[sendPrompt] Failed to send initial status:', e); }
+    }
 
     let isFinalized = false;
     let elapsedTimer: ReturnType<typeof setInterval> | null = null;
@@ -464,7 +486,7 @@ async function sendPromptToAntigravity(
             refreshProgress(progressTitle(), progressFooter(), { expectedVersion: v, skipWhenFinalized: true }).catch(() => { });
         };
 
-        await refreshProgress(progressTitle(), progressFooter());
+        await (skipProgress ? Promise.resolve() : refreshProgress(progressTitle(), progressFooter()));
 
         monitor = new ResponseMonitor({
             cdpService: cdp,
@@ -473,7 +495,7 @@ async function sendPromptToAntigravity(
             stopGoneConfirmCount: 3,
             onPhaseChange: () => { },
             onProcessLog: (logText) => {
-                if (isFinalized) return;
+                if (isFinalized || skipProgress) return;
                 const trimmed = (logText || '').trim();
                 if (!trimmed || isJunkEntry(trimmed)) return;
                 const formatted = formatActivityLine(trimmed);
@@ -484,7 +506,7 @@ async function sendPromptToAntigravity(
                 }
             },
             onThinkingLog: (thinkingText) => {
-                if (isFinalized) return;
+                if (isFinalized || skipProgress) return;
                 const trimmed = (thinkingText || '').trim();
                 if (!trimmed) return;
                 logger.debug('[Bot] onThinkingLog received:', trimmed.slice(0, 100));
@@ -605,6 +627,7 @@ async function sendPromptToAntigravity(
                     // Send collapsible thinking block as a separate message before the response.
                     // Extract both label and content directly from DOM at completion time,
                     // so we don't depend on polling (2s interval) having captured thinking events.
+                    if (!skipProgress) {
                     try {
                         const thinkExtract = await cdp.call('Runtime.evaluate', {
                             expression: `(function() {
@@ -667,6 +690,7 @@ async function sendPromptToAntigravity(
                             logger.info('[Bot] No thinking blocks found in DOM at completion time');
                         }
                     } catch (e) { logger.error('[Bot] Failed to send thinking block:', e); }
+                    } // end if (!skipProgress) — thinking block
 
                     if (finalOutputText && finalOutputText.trim().length > 0) {
                         logger.divider(`Output (${finalOutputText.length} chars)`);
@@ -675,10 +699,12 @@ async function sendPromptToAntigravity(
                     logger.divider();
 
                     // Compact progress message: show completed title + event log
+                    if (!skipProgress) {
                     liveActivityUpdateVersion += 1;
                     thinkingActive = false;
                     const completedBody = buildProgressBody();
                     await setProgressMessage(`<b>${PHASE_ICONS.complete} ${escapeHtml(modelLabel)} · ${elapsed}s</b>\n\n${completedBody}`, { expectedVersion: liveActivityUpdateVersion });
+                    }
 
                     liveResponseUpdateVersion += 1;
                     if (finalOutputText && finalOutputText.trim().length > 0) {
@@ -747,7 +773,11 @@ async function sendPromptToAntigravity(
 
         elapsedTimer = setInterval(() => {
             if (isFinalized) { clearInterval(elapsedTimer!); return; }
-            triggerProgressRefresh();
+            if (!skipProgress) triggerProgressRefresh();
+            // [KaizenGuy] Send typing indicator so user knows bot is working
+            if (skipProgress) {
+                api.sendChatAction(channel.chatId, 'typing', { message_thread_id: channel.threadId }).catch(() => { });
+            }
         }, 5000);
 
     } catch (e: any) {

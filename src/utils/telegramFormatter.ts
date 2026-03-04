@@ -171,7 +171,13 @@ function formatMarkdownLine(line: string): string {
     result = result.replace(/`([^`]+)`/g, '<code>$1</code>');
 
     // Links: [text](url) → <a href="url">text</a>
-    result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+    // [KaizenGuy] Strip file:// links — Telegram only supports http/https/tg protocols
+    result = result.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, text, url) => {
+        if (url.startsWith('file://') || url.startsWith('file%3A')) {
+            return `<code>${text}</code>`;
+        }
+        return `<a href="${url}">${text}</a>`;
+    });
 
     // Bold: **text** or __text__ → <b>text</b>
     result = result.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
