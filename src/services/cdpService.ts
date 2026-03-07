@@ -291,9 +291,10 @@ export class CdpService extends EventEmitter {
      * @param workspacePath Full workspace path (e.g., /home/user/Code/MyProject)
      * @returns true on successful connection
      */
-    async discoverAndConnectForWorkspace(workspacePath: string): Promise<boolean> {
+    async discoverAndConnectForWorkspace(workspacePath: string, options?: { autoLaunch?: boolean }): Promise<boolean> {
         const projectName = extractProjectNameFromPath(workspacePath);
         this.currentWorkspacePath = workspacePath;
+        const autoLaunch = options?.autoLaunch ?? true;
 
         // Re-validate existing connection before skipping reconnect.
         if (this.isConnectedFlag && this.currentWorkspaceName === projectName) {
@@ -308,7 +309,7 @@ export class CdpService extends EventEmitter {
 
         this.isSwitchingWorkspace = true;
         try {
-            return await this._discoverAndConnectForWorkspaceImpl(workspacePath, projectName);
+            return await this._discoverAndConnectForWorkspaceImpl(workspacePath, projectName, autoLaunch);
         } finally {
             this.isSwitchingWorkspace = false;
         }
@@ -342,6 +343,7 @@ export class CdpService extends EventEmitter {
     private async _discoverAndConnectForWorkspaceImpl(
         workspacePath: string,
         projectName: string,
+        autoLaunch: boolean = true,
     ): Promise<boolean> {
         // Scan all ports to collect workbench pages
         let pages: any[] = [];
@@ -367,6 +369,9 @@ export class CdpService extends EventEmitter {
         }
 
         if (respondingPort === null) {
+            if (!autoLaunch) {
+                throw new Error(`Antigravity is not running. Auto-launch disabled (reconnect mode).`);
+            }
             // Launch Antigravity if no port responds
             return this.launchAndConnectWorkspace(workspacePath, projectName);
         }
@@ -399,7 +404,10 @@ export class CdpService extends EventEmitter {
             return true;
         }
 
-        // 3. If not found by probe either, launch a new window
+        // 3. If not found by probe either, launch a new window (unless autoLaunch is disabled)
+        if (!autoLaunch) {
+            throw new Error(`Workspace "${projectName}" not found. Auto-launch disabled (reconnect mode).`);
+        }
         return this.launchAndConnectWorkspace(workspacePath, projectName);
     }
 
@@ -805,7 +813,7 @@ export class CdpService extends EventEmitter {
             try {
                 this.contexts = [];
                 if (this.currentWorkspacePath) {
-                    await this.discoverAndConnectForWorkspace(this.currentWorkspacePath);
+                    await this.discoverAndConnectForWorkspace(this.currentWorkspacePath, { autoLaunch: false });
                 } else {
                     await this.discoverTarget();
                     await this.connect();

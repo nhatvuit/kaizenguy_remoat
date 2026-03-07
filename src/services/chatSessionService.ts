@@ -1,4 +1,5 @@
 import { CdpService } from './cdpService';
+import { logger } from '../utils/logger';
 
 /** Session list item from the side panel */
 export interface SessionListItem {
@@ -92,6 +93,7 @@ const FIND_PAST_CONVERSATIONS_BUTTON_SCRIPT = `(() => {
  *
  * Returns: { sessions: SessionListItem[] }
  */
+// [KaizenGuy] Rewritten based on actual Antigravity DOM (QuickPick UI in .jetski-fast-pick)
 const SCRAPE_PAST_CONVERSATIONS_SCRIPT = `(() => {
     const isVisible = (el) => !!el && el instanceof HTMLElement && el.offsetParent !== null;
     const normalize = (text) => (text || '').trim();
@@ -99,15 +101,16 @@ const SCRAPE_PAST_CONVERSATIONS_SCRIPT = `(() => {
     const items = [];
     const seen = new Set();
 
-    // Find the scrollable conversation list container
-    const containers = Array.from(document.querySelectorAll('div[class*="overflow-auto"], div[class*="overflow-y-scroll"]'));
-    const container = containers.find((c) => isVisible(c) && c.querySelectorAll('div[class*="cursor-pointer"]').length > 0) || document;
+    // The Past Conversations panel is a QuickPick UI inside .jetski-fast-pick
+    const quickPick = document.querySelector('.jetski-fast-pick');
+    const container = quickPick
+        ? (quickPick.querySelector('.bg-quickinput-background') || quickPick)
+        : document;
 
     // Detect the "Other Conversations" section boundary.
-    // Sessions below this header belong to other projects and must be excluded.
     let boundaryTop = Infinity;
-    const headerCandidates = container.querySelectorAll('div[class*="text-xs"][class*="opacity"]');
-    for (const el of headerCandidates) {
+    const sectionLabels = container.querySelectorAll('div[class*="opacity"]');
+    for (const el of sectionLabels) {
         if (!isVisible(el)) continue;
         const t = normalize(el.textContent || '');
         if (/^Other\\s+Conversations?$/i.test(t)) {
@@ -116,28 +119,44 @@ const SCRAPE_PAST_CONVERSATIONS_SCRIPT = `(() => {
         }
     }
 
-    // Each session row is a div with cursor-pointer
-    const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"]'));
+    // Each conversation row is a div with cursor-pointer inside the QuickPick
+    const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"][class*="flex"][class*="items-center"][class*="justify-between"]'));
     for (const row of rows) {
         if (!isVisible(row)) continue;
-        // Skip rows that are below the "Other Conversations" boundary
+        // Skip rows below "Other Conversations" boundary
         if (row.getBoundingClientRect().top >= boundaryTop) continue;
-        // Find the session title — nested span within the row
-        const spans = Array.from(row.querySelectorAll('span.text-sm span, span.text-sm'));
+
+        // Title is in: div > div > span.text-sm > span
+        const titleSpans = row.querySelectorAll('span.text-sm span, span[class*="text-sm"] span');
         let title = '';
-        for (const span of spans) {
+        for (const span of titleSpans) {
             const t = normalize(span.textContent || '');
-            // Skip timestamp labels like "1 hr ago", "7 mins ago"
+            // Skip empty, timestamps, and action labels
+            if (!t || t.length < 2 || t.length > 200) continue;
             if (/^\\d+\\s+(min|hr|hour|day|sec|week|month|year)s?\\s+ago$/i.test(t)) continue;
-            // Skip very short or action-like labels
-            if (t.length < 2 || t.length > 200) continue;
+            if (/^(now|just now)$/i.test(t)) continue;
             if (/^(show\\s+\\d+\\s+more|new|past|history|settings|close|menu)\\b/i.test(t)) continue;
             title = t;
             break;
         }
+
+        // Fallback: try direct text-sm span without nested span
+        if (!title) {
+            const directSpans = row.querySelectorAll('span.text-sm, span[class*="text-sm"]');
+            for (const span of directSpans) {
+                const t = normalize(span.textContent || '');
+                if (!t || t.length < 2 || t.length > 200) continue;
+                if (/^\\d+\\s+(min|hr|hour|day|sec|week|month|year)s?\\s+ago$/i.test(t)) continue;
+                if (/^(now|just now)$/i.test(t)) continue;
+                title = t;
+                break;
+            }
+        }
+
         if (!title || seen.has(title)) continue;
         seen.add(title);
-        // Detect if this is the active/current session (has focusBackground class)
+
+        // Detect active session via focusBackground class
         const isActive = /focusBackground/i.test(row.className || '');
         items.push({ title, isActive });
     }
@@ -460,16 +479,22 @@ export class ChatSessionService {
      */
     async listAllSessions(cdpService: CdpService): Promise<SessionListItem[]> {
         try {
+            const ctxs = cdpService.getContexts();
+            logger.info(`[listAllSessions] contexts=${ctxs.length} ids=${ctxs.map(c => c.id).join(',')}`);
+
             // Step 1: Find Past Conversations button
             const btnState = await this.evaluateOnAnyContext(
                 cdpService, FIND_PAST_CONVERSATIONS_BUTTON_SCRIPT, false,
             );
+            logger.info(`[listAllSessions] Step1 btnState=${JSON.stringify(btnState)}`);
             if (!btnState?.found) {
+                logger.warn(`[listAllSessions] Past Conversations button NOT found`);
                 return [];
             }
 
             // Step 2: Click via CDP mouse events (reliable in Electron)
             await this.cdpMouseClick(cdpService, btnState.x, btnState.y);
+            logger.info(`[listAllSessions] Step2 clicked at (${btnState.x}, ${btnState.y})`);
 
             // Step 3: Wait for panel to render
             await new Promise((r) => setTimeout(r, 500));
@@ -479,6 +504,7 @@ export class ChatSessionService {
                 cdpService, SCRAPE_PAST_CONVERSATIONS_SCRIPT, false,
             );
             let sessions: SessionListItem[] = scrapeResult?.sessions ?? [];
+            logger.info(`[listAllSessions] Step4 scraped ${sessions.length} sessions`);
 
             // Step 5: If fewer than TARGET, click "Show N more..."
             if (sessions.length < ChatSessionService.LIST_SESSIONS_TARGET) {
@@ -494,6 +520,7 @@ export class ChatSessionService {
                         cdpService, SCRAPE_PAST_CONVERSATIONS_SCRIPT, false,
                     );
                     sessions = scrapeResult?.sessions ?? [];
+                    logger.info(`[listAllSessions] Step6 re-scraped ${sessions.length} sessions`);
                 }
             }
 
@@ -506,9 +533,11 @@ export class ChatSessionService {
                 type: 'keyUp', key: 'Escape', code: 'Escape',
                 windowsVirtualKeyCode: 27, nativeVirtualKeyCode: 27,
             });
+            logger.info(`[listAllSessions] Step7 closed panel, returning ${sessions.length} sessions`);
 
             return sessions.slice(0, ChatSessionService.LIST_SESSIONS_TARGET);
-        } catch (_) {
+        } catch (err: any) {
+            logger.error(`[listAllSessions] Error: ${err.message}`);
             return [];
         }
     }
