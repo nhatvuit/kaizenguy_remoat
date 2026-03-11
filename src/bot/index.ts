@@ -96,6 +96,7 @@ import {
   AUTOACCEPT_BTN_REFRESH,
 } from "../ui/autoAcceptUi";
 import { handleScreenshot } from "../ui/screenshotUi";
+import { startNotificationService } from "../services/notificationService";
 import {
   buildProjectListUI,
   PROJECT_SELECT_ID,
@@ -1189,6 +1190,9 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
   const bot = new Bot(config.telegramBotToken);
   bridge.botApi = bot.api;
+
+  // [KaizenGuy] Start push notification HTTP endpoint
+  startNotificationService(bot.api, config.allowedUserIds.map(Number));
 
   // Notify user on WebSocket connection lifecycle events
   bridge.pool.on("workspace:disconnected", (projectName: string) => {
