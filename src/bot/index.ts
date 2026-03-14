@@ -2768,6 +2768,75 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       return;
     }
 
+    // =========================================================================
+    // [KaizenGuy] /notify — gửi text/photo ra Telegram qua Grammy bot
+    // POST http://localhost:9999/notify
+    //   { "text": "nội dung" }
+    //   { "text": "caption", "photo": "/absolute/path/to/image.png" }
+    // Auth: Bearer <telegramBotToken>
+    // =========================================================================
+    if (req.method === "POST" && req.url?.startsWith("/notify")) {
+      const notifyAuthHeader = req.headers.authorization || "";
+      const notifyExpectedToken = `Bearer ${config.telegramBotToken}`;
+      if (notifyAuthHeader !== notifyExpectedToken) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      let notifyBody = "";
+      for await (const chunk of req) notifyBody += chunk;
+      let notifyData: { text?: string; photo?: string; chat_id?: string };
+      try {
+        notifyData = JSON.parse(notifyBody);
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: 'Invalid JSON. Expected: { "text": "...", "photo": "/path" }' }));
+        return;
+      }
+
+      const notifyText = (notifyData.text || "").trim();
+      const notifyPhoto = (notifyData.photo || "").trim();
+      const notifyChatId = notifyData.chat_id || config.allowedUserIds?.[0] || "";
+
+      if (!notifyText && !notifyPhoto) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Need text or photo" }));
+        return;
+      }
+
+      if (!notifyChatId) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "No chat_id and no allowedUserIds configured" }));
+        return;
+      }
+
+      try {
+        if (notifyPhoto) {
+          const { readFileSync } = await import("fs");
+          const photoBuffer = readFileSync(notifyPhoto);
+          const { InputFile } = await import("grammy");
+          await bot.api.sendPhoto(
+            Number(notifyChatId),
+            new InputFile(photoBuffer, notifyPhoto.split("/").pop() || "photo.png"),
+            { caption: notifyText || undefined }
+          );
+          logger.info(`[HTTP /notify] Sent photo to ${notifyChatId}`);
+        } else {
+          await bot.api.sendMessage(Number(notifyChatId), notifyText);
+          logger.info(`[HTTP /notify] Sent text to ${notifyChatId}`);
+        }
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
+      } catch (e: any) {
+        logger.error("[HTTP /notify] Error:", e.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
     if (req.method !== "POST" || !req.url?.startsWith("/send")) {
       res.writeHead(404);
       res.end("Not found");

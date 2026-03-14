@@ -48,11 +48,11 @@ export function checkWhisperAvailability(): string | null {
     );
     try {
         const files = require('fs').readdirSync(modelsDir) as string[];
-        if (!files.some((f: string) => f.includes('base.en'))) throw new Error();
+        if (!files.some((f: string) => f.endsWith('ggml-base.bin'))) throw new Error();
     } catch {
         return (
             '🔇 Whisper model not downloaded.\n\n' +
-            'Run this once to fetch the base.en model (~140 MB):\n' +
+            'Run this once to fetch the base model (~140 MB):\n' +
             '  npx nodejs-whisper download'
         );
     }
@@ -126,8 +126,8 @@ export async function transcribeVoice(voicePath: string): Promise<string | null>
         const { nodewhisper } = require('nodejs-whisper') as typeof import('nodejs-whisper');
 
         const result = await nodewhisper(voicePath, {
-            modelName: 'base.en',
-            autoDownloadModelName: 'base.en',
+            modelName: 'base',
+            autoDownloadModelName: 'base',
             removeWavFileAfterTranscription: true,
             whisperOptions: {
                 outputInText: true,
