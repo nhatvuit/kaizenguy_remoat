@@ -6,9 +6,9 @@ import * as path from 'path';
 import { ExtractedResponseImage } from '../services/cdpService';
 import { logger } from './logger';
 
-const MAX_INBOUND_IMAGE_ATTACHMENTS = 4;
+const MAX_INBOUND_IMAGE_ATTACHMENTS = 10;
 const IMAGE_EXT_PATTERN = /\.(png|jpe?g|webp|gif|bmp)$/i;
-const TEMP_IMAGE_DIR = path.join(os.tmpdir(), 'remoat-images');
+const TEMP_IMAGE_DIR = path.join(os.homedir(), '.remoat', 'images');
 
 export interface InboundImageAttachment {
     localPath: string;

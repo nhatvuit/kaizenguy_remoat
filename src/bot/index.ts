@@ -71,7 +71,7 @@ import {
 // ProcessLogBuffer no longer used — progress display uses ordered event stream
 import {
   buildPromptWithAttachmentUrls,
-  cleanupInboundImageAttachments,
+
   downloadTelegramImages,
   InboundImageAttachment,
   isImageAttachment,
@@ -2597,6 +2597,52 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     });
   });
 
+  // [KaizenGuy] Media group buffer — gom ảnh cùng album trước khi inject
+  const mediaGroupBuffer = new Map<string, {
+    photos: Array<{ file_id: string; file_size?: number }>;
+    caption: string;
+    channel: TelegramChannel;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+
+  async function processPhotoGroup(
+    ch: TelegramChannel,
+    photos: Array<{ file_id: string; file_size?: number }>,
+    caption: string,
+  ): Promise<void> {
+    const resolved = await resolveWorkspaceAndCdp(ch);
+    if (!resolved) return;
+
+    const inboundImages = await downloadTelegramImages(
+      bot.api,
+      config.telegramBotToken,
+      photos,
+      String(Date.now()),
+    );
+
+    if (inboundImages.length === 0) return;
+
+    // Append local paths to prompt so Antigravity knows where files are
+    const pathLines = inboundImages.map((img, i) =>
+      `${i + 1}. ${img.name} → ${img.localPath}`
+    ).join("\n");
+    const fullPrompt = `${caption}\n\n[Local image files]\n${pathLines}`;
+
+    await promptDispatcher.send({
+      channel: ch,
+      prompt: fullPrompt,
+      cdp: resolved.cdp,
+      inboundImages,
+      options: {
+        chatSessionService,
+        chatSessionRepo,
+        topicManager,
+        titleGenerator,
+      },
+    });
+    // [KaizenGuy] Do NOT cleanup — keep images in ~/.remoat/images/ for local access
+  }
+
   // Photo message handler
   bot.on("message:photo", async (ctx) => {
     const ch = getChannel(ctx);
@@ -2608,34 +2654,49 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       ctx.message.caption?.trim() ||
       "Please review the attached images and respond accordingly.";
 
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    if (!resolved) {
-      await ctx.reply("No project configured. Use /project first.");
-      return;
-    }
+    const mediaGroupId = ctx.message.media_group_id;
 
-    const inboundImages = await downloadTelegramImages(
-      bot.api,
-      config.telegramBotToken,
-      [largest],
-      String(ctx.message.message_id),
-    );
-
-    try {
-      await promptDispatcher.send({
-        channel: ch,
-        prompt: caption,
-        cdp: resolved.cdp,
-        inboundImages,
-        options: {
-          chatSessionService,
-          chatSessionRepo,
-          topicManager,
-          titleGenerator,
-        },
-      });
-    } finally {
-      await cleanupInboundImageAttachments(inboundImages);
+    if (mediaGroupId) {
+      // Album mode — buffer photos with same media_group_id
+      const existing = mediaGroupBuffer.get(mediaGroupId);
+      if (existing) {
+        existing.photos.push(largest);
+        if (caption !== "Please review the attached images and respond accordingly.") {
+          existing.caption = caption; // Use caption from whichever message has one
+        }
+        clearTimeout(existing.timer);
+        existing.timer = setTimeout(async () => {
+          mediaGroupBuffer.delete(mediaGroupId);
+          try {
+            await processPhotoGroup(existing.channel, existing.photos, existing.caption);
+          } catch (e: any) {
+            logger.error("[PhotoGroup] Error processing album:", e?.message);
+          }
+        }, 1000);
+      } else {
+        const entry = {
+          photos: [largest],
+          caption,
+          channel: ch,
+          timer: setTimeout(async () => {
+            mediaGroupBuffer.delete(mediaGroupId);
+            try {
+              await processPhotoGroup(entry.channel, entry.photos, entry.caption);
+            } catch (e: any) {
+              logger.error("[PhotoGroup] Error processing album:", e?.message);
+            }
+          }, 1000),
+        };
+        mediaGroupBuffer.set(mediaGroupId, entry);
+      }
+    } else {
+      // Single photo — process immediately
+      const resolved = await resolveWorkspaceAndCdp(ch);
+      if (!resolved) {
+        await ctx.reply("No project configured. Use /project first.");
+        return;
+      }
+      await processPhotoGroup(ch, [largest], caption);
     }
   });
 
@@ -2769,10 +2830,11 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     }
 
     // =========================================================================
-    // [KaizenGuy] /notify — gửi text/photo ra Telegram qua Grammy bot
+    // [KaizenGuy] /notify — gửi text/photo/album ra Telegram qua Grammy bot
     // POST http://localhost:9999/notify
     //   { "text": "nội dung" }
     //   { "text": "caption", "photo": "/absolute/path/to/image.png" }
+    //   { "text": "caption", "photos": ["/path/img1.png", "/path/img2.png"] }
     // Auth: Bearer <telegramBotToken>
     // =========================================================================
     if (req.method === "POST" && req.url?.startsWith("/notify")) {
@@ -2786,7 +2848,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
 
       let notifyBody = "";
       for await (const chunk of req) notifyBody += chunk;
-      let notifyData: { text?: string; photo?: string; chat_id?: string };
+      let notifyData: { text?: string; photo?: string; photos?: string[]; chat_id?: string };
       try {
         notifyData = JSON.parse(notifyBody);
       } catch {
@@ -2799,9 +2861,11 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       const notifyPhoto = (notifyData.photo || "").trim();
       const notifyChatId = notifyData.chat_id || config.allowedUserIds?.[0] || "";
 
-      if (!notifyText && !notifyPhoto) {
+      const notifyPhotos = notifyData.photos || [];
+
+      if (!notifyText && !notifyPhoto && notifyPhotos.length === 0) {
         res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Need text or photo" }));
+        res.end(JSON.stringify({ error: "Need text, photo, or photos" }));
         return;
       }
 
@@ -2812,7 +2876,23 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       }
 
       try {
-        if (notifyPhoto) {
+        if (notifyPhotos.length > 0) {
+          // [KaizenGuy] Album mode — sendMediaGroup, auto-batch max 10 per group
+          const { readFileSync } = await import("fs");
+          const { InputFile } = await import("grammy");
+          const BATCH_SIZE = 10;
+          const totalBatches = Math.ceil(notifyPhotos.length / BATCH_SIZE);
+          for (let b = 0; b < totalBatches; b++) {
+            const batch = notifyPhotos.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+            const media = batch.map((p: string, i: number) => ({
+              type: "photo" as const,
+              media: new InputFile(readFileSync(p), p.split("/").pop() || `photo${i}.png`),
+              ...(b === 0 && i === 0 && notifyText ? { caption: notifyText } : {}),
+            }));
+            await bot.api.sendMediaGroup(Number(notifyChatId), media);
+          }
+          logger.info(`[HTTP /notify] Sent ${notifyPhotos.length} photos (${totalBatches} batch) to ${notifyChatId}`);
+        } else if (notifyPhoto) {
           const { readFileSync } = await import("fs");
           const photoBuffer = readFileSync(notifyPhoto);
           const { InputFile } = await import("grammy");
