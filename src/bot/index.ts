@@ -97,6 +97,8 @@ import {
 } from "../ui/autoAcceptUi";
 import { handleScreenshot } from "../ui/screenshotUi";
 import { startNotificationService } from "../services/notificationService";
+import { ScheduleRepository } from "../database/scheduleRepository";
+import { ScheduleService } from "../services/scheduleService";
 import {
   buildProjectListUI,
   PROJECT_SELECT_ID,
@@ -1194,6 +1196,44 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
   // [KaizenGuy] Start push notification HTTP endpoint
   startNotificationService(bot.api, config.allowedUserIds.map(Number));
 
+  // [KaizenGuy] Schedule Service — cron jobs gửi prompt tự động cho Antigravity
+  const scheduleRepo = new ScheduleRepository(db);
+  const scheduleService = new ScheduleService(scheduleRepo);
+  const restoredCount = scheduleService.restoreAll(async (schedule) => {
+    try {
+      logger.info(`[Schedule] Firing job #${schedule.id}: ${schedule.prompt.substring(0, 80)}...`);
+      const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
+      const projectName = bridge.pool.extractProjectName(schedule.workspacePath);
+      bridge.lastActiveWorkspace = projectName;
+
+      // Dùng channel mặc định (chat chính của owner)
+      const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+      const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
+      bridge.lastActiveChannel = scheduleCh;
+
+      await promptDispatcher.send({
+        channel: scheduleCh,
+        prompt: schedule.prompt,
+        cdp,
+        inboundImages: [],
+        options: {
+          chatSessionService,
+          chatSessionRepo,
+          topicManager,
+          titleGenerator,
+        },
+      });
+    } catch (e: any) {
+      logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
+      // Gửi thông báo lỗi qua Telegram
+      const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+      if (defaultChatId && bot.api) {
+        bot.api.sendMessage(defaultChatId, `⚠️ Schedule job #${schedule.id} failed: ${e.message}`).catch(() => {});
+      }
+    }
+  });
+  logger.info(`[Schedule] Restored ${restoredCount} scheduled job(s)`);
+
   // Notify user on WebSocket connection lifecycle events
   bridge.pool.on("workspace:disconnected", (projectName: string) => {
     const channel = bridge.lastActiveChannel;
@@ -1575,6 +1615,137 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     const workspaces = workspaceService.scanWorkspaces();
     const { text, keyboard } = buildProjectListUI(workspaces, 0);
     await replyHtml(ctx, text, keyboard);
+  });
+
+  // [KaizenGuy] /schedule command — quản lý scheduled jobs từ Telegram
+  bot.command("schedule", async (ctx) => {
+    const args = (ctx.match || "").trim();
+    const parts = args.split(/\s+/);
+    const subCmd = parts[0]?.toLowerCase();
+
+    if (!subCmd || subCmd === "list") {
+      // /schedule list
+      const jobs = scheduleService.listSchedules();
+      if (jobs.length === 0) {
+        await ctx.reply("📭 Không có schedule nào.");
+        return;
+      }
+      let text = `<b>🕒 Scheduled Jobs (${jobs.length})</b>\n\n`;
+      for (const job of jobs) {
+        const status = job.enabled ? "🟢" : "⚪";
+        const promptPreview = job.prompt.length > 60 ? job.prompt.substring(0, 60) + "..." : job.prompt;
+        text += `${status} <b>#${job.id}</b> | <code>${escapeHtml(job.cronExpression)}</code>\n`;
+        text += `   <i>${escapeHtml(promptPreview)}</i>\n\n`;
+      }
+      text += `<i>Dùng /schedule add, /schedule remove, /schedule toggle</i>`;
+      await replyHtml(ctx, text);
+    } else if (subCmd === "add") {
+      // /schedule add <cron> | <prompt>
+      const rest = args.substring(4).trim();
+      const pipeIndex = rest.indexOf("|");
+      if (pipeIndex === -1) {
+        await ctx.reply("Usage: /schedule add <cron_expression> | <prompt>\nVD: /schedule add 0 9 * * * | Nhắc anh Vũ uống nước");
+        return;
+      }
+      const cronExpr = rest.substring(0, pipeIndex).trim();
+      const prompt = rest.substring(pipeIndex + 1).trim();
+      if (!cronExpr || !prompt) {
+        await ctx.reply("Cron expression và prompt không được trống.");
+        return;
+      }
+      try {
+        const ch = getChannel(ctx);
+        const binding = workspaceBindingRepo.findByChannelId(channelKey(ch));
+        const wsPath = binding?.workspacePath || config.workspaceBaseDir;
+        const record = scheduleService.addSchedule(cronExpr, prompt, wsPath, async (schedule) => {
+          try {
+            logger.info(`[Schedule] Firing job #${schedule.id}: ${schedule.prompt.substring(0, 80)}...`);
+            const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
+            const projectName = bridge.pool.extractProjectName(schedule.workspacePath);
+            bridge.lastActiveWorkspace = projectName;
+            const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+            const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
+            bridge.lastActiveChannel = scheduleCh;
+            await promptDispatcher.send({
+              channel: scheduleCh,
+              prompt: schedule.prompt,
+              cdp,
+              inboundImages: [],
+              options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+            });
+          } catch (e: any) {
+            logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
+            const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+            if (defaultChatId && bot.api) {
+              bot.api.sendMessage(defaultChatId, `⚠️ Schedule job #${schedule.id} failed: ${e.message}`).catch(() => {});
+            }
+          }
+        });
+        await replyHtml(ctx, `✅ Schedule #${record.id} đã tạo\n<code>${escapeHtml(cronExpr)}</code>\n<i>${escapeHtml(prompt.substring(0, 100))}</i>`);
+      } catch (e: any) {
+        await ctx.reply(`❌ Lỗi: ${e.message}`);
+      }
+    } else if (subCmd === "remove" || subCmd === "rm" || subCmd === "delete") {
+      // /schedule remove <id>
+      const id = parseInt(parts[1]);
+      if (!id || isNaN(id)) {
+        await ctx.reply("Usage: /schedule remove <id>");
+        return;
+      }
+      const removed = scheduleService.removeSchedule(id);
+      if (removed) {
+        await ctx.reply(`✅ Schedule #${id} đã xoá (cron đã dừng).`);
+      } else {
+        await ctx.reply(`❌ Không tìm thấy schedule #${id}.`);
+      }
+    } else if (subCmd === "toggle") {
+      // /schedule toggle <id>
+      const id = parseInt(parts[1]);
+      if (!id || isNaN(id)) {
+        await ctx.reply("Usage: /schedule toggle <id>");
+        return;
+      }
+      const jobs = scheduleService.listSchedules();
+      const job = jobs.find(j => j.id === id);
+      if (!job) {
+        await ctx.reply(`❌ Không tìm thấy schedule #${id}.`);
+        return;
+      }
+      // Toggle: nếu đang enabled thì remove (stop cron), nếu disabled thì re-add
+      if (job.enabled) {
+        scheduleService.removeSchedule(id);
+        // Re-insert as disabled
+        const db2 = db; // reuse same db reference
+        db2.prepare("INSERT INTO schedules (id, cron_expression, prompt, workspace_path, enabled) VALUES (?, ?, ?, ?, 0)").run(id, job.cronExpression, job.prompt, job.workspacePath);
+        await ctx.reply(`⚪ Schedule #${id} đã tắt.`);
+      } else {
+        // Enable: delete disabled record, re-add as enabled
+        db.prepare("DELETE FROM schedules WHERE id = ?").run(id);
+        scheduleService.addSchedule(job.cronExpression, job.prompt, job.workspacePath, async (schedule) => {
+          try {
+            const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
+            const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+            const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
+            bridge.lastActiveChannel = scheduleCh;
+            await promptDispatcher.send({
+              channel: scheduleCh, prompt: schedule.prompt, cdp, inboundImages: [],
+              options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+            });
+          } catch (e: any) {
+            logger.error(`[Schedule] Job failed:`, e.message);
+          }
+        });
+        await ctx.reply(`🟢 Schedule #${id} đã bật lại.`);
+      }
+    } else {
+      await replyHtml(ctx,
+        `<b>🕒 /schedule commands</b>\n\n` +
+        `/schedule list — Xem danh sách\n` +
+        `/schedule add &lt;cron&gt; | &lt;prompt&gt; — Thêm mới\n` +
+        `/schedule remove &lt;id&gt; — Xoá\n` +
+        `/schedule toggle &lt;id&gt; — Bật/tắt`
+      );
+    }
   });
 
   // /new command
@@ -2911,6 +3082,74 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         res.end(JSON.stringify({ ok: true }));
       } catch (e: any) {
         logger.error("[HTTP /notify] Error:", e.message);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    // [KaizenGuy] /api/schedule — quản lý schedule qua HTTP (cho Antigravity gọi bằng curl)
+    if (req.url?.startsWith("/api/schedule")) {
+      const scheduleAuthHeader = req.headers.authorization || "";
+      const scheduleExpectedToken = `Bearer ${config.telegramBotToken}`;
+      if (scheduleAuthHeader !== scheduleExpectedToken) {
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Unauthorized" }));
+        return;
+      }
+
+      let scheduleBody = "";
+      for await (const chunk of req) scheduleBody += chunk;
+
+      try {
+        const params = scheduleBody ? JSON.parse(scheduleBody) : {};
+        const action = params.action || "list";
+
+        if (action === "list") {
+          const jobs = scheduleService.listSchedules();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, schedules: jobs }));
+        } else if (action === "add") {
+          const { cron, prompt, workspace } = params;
+          if (!cron || !prompt) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Missing cron or prompt" }));
+            return;
+          }
+          const wsPath = workspace || config.workspaceBaseDir;
+          const record = scheduleService.addSchedule(cron, prompt, wsPath, async (schedule) => {
+            try {
+              logger.info(`[Schedule] Firing job #${schedule.id}: ${schedule.prompt.substring(0, 80)}...`);
+              const cdp2 = await bridge.pool.getOrConnect(schedule.workspacePath);
+              bridge.lastActiveWorkspace = bridge.pool.extractProjectName(schedule.workspacePath);
+              const defChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+              const sch: TelegramChannel = { chatId: defChatId, threadId: undefined };
+              bridge.lastActiveChannel = sch;
+              await promptDispatcher.send({
+                channel: sch, prompt: schedule.prompt, cdp: cdp2, inboundImages: [],
+                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+              });
+            } catch (e: any) {
+              logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
+            }
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, schedule: record }));
+        } else if (action === "remove") {
+          const { id } = params;
+          if (!id) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "Missing id" }));
+            return;
+          }
+          const removed = scheduleService.removeSchedule(id);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true, removed }));
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "Unknown action. Use: list, add, remove" }));
+        }
+      } catch (e: any) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: e.message }));
       }
