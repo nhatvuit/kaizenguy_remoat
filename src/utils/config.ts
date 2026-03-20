@@ -12,6 +12,7 @@ export interface AppConfig {
     extractionMode: ExtractionMode;
     useTopics: boolean;
     disableProgressLog: boolean;
+    enableTelegramHint: boolean;
 }
 
 export type ResponseDeliveryMode = 'stream';

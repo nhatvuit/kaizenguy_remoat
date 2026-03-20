@@ -664,10 +664,19 @@ async function sendPromptToAntigravity(
   let monitor: ResponseMonitor | null = null;
 
   try {
+    // [KaizenGuy] Append Telegram delivery hint so the agent knows output
+    // will be displayed on Telegram and can format response accordingly.
+    // Details about Telegram formatting rules are in the agent's remoat-admin skill.
+    const TELEGRAM_HINT = `\n\n[remoat:telegram]`;
+
+    const hintedPrompt = loadConfig().enableTelegramHint
+      ? prompt + TELEGRAM_HINT
+      : prompt;
+
     let injectResult;
     if (inboundImages.length > 0) {
       injectResult = await cdp.injectMessageWithImageFiles(
-        prompt,
+        hintedPrompt,
         inboundImages.map((i) => i.localPath),
       );
       if (!injectResult.ok) {
@@ -676,11 +685,11 @@ async function sendPromptToAntigravity(
           t("Failed to attach image directly, resending via URL reference."),
         );
         injectResult = await cdp.injectMessage(
-          buildPromptWithAttachmentUrls(prompt, inboundImages),
+          buildPromptWithAttachmentUrls(hintedPrompt, inboundImages),
         );
       }
     } else {
-      injectResult = await cdp.injectMessage(prompt);
+      injectResult = await cdp.injectMessage(hintedPrompt);
     }
 
     if (!injectResult.ok) {
@@ -1205,6 +1214,14 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
       const projectName = bridge.pool.extractProjectName(schedule.workspacePath);
       bridge.lastActiveWorkspace = projectName;
+
+      // [KaizenGuy] Tạo chat mới trước khi gửi prompt — tránh đụng chat đang mở
+      const newChatResult = await chatSessionService.startNewChat(cdp);
+      if (newChatResult.ok) {
+        logger.info(`[Schedule] New chat created for job #${schedule.id}`);
+      } else {
+        logger.warn(`[Schedule] Could not create new chat for job #${schedule.id}: ${newChatResult.error}. Proceeding with current chat.`);
+      }
 
       // Dùng channel mặc định (chat chính của owner)
       const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;

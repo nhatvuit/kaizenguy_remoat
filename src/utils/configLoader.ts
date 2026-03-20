@@ -20,6 +20,7 @@ export interface PersistedConfig {
     extractionMode?: 'legacy' | 'structured';
     useTopics?: boolean;
     disableProgressLog?: boolean;
+    enableTelegramHint?: boolean;
 }
 
 function getConfigDir(): string {
@@ -93,6 +94,12 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         false,
     );
 
+    const enableTelegramHint = resolveBoolean(
+        process.env.ENABLE_TELEGRAM_HINT,
+        persisted.enableTelegramHint,
+        true,
+    );
+
     return {
         telegramBotToken: token,
         allowedUserIds,
@@ -102,6 +109,7 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         extractionMode,
         useTopics,
         disableProgressLog,
+        enableTelegramHint,
     };
 }
 
