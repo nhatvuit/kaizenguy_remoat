@@ -48,7 +48,7 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
+            var nc = node.closest('.notify-user-container'); if (nc && (node.closest('button') || node.closest('[role=\"button\"]'))) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -226,7 +226,7 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
+            var nc = node.closest('.notify-user-container'); if (nc && (node.closest('button') || node.closest('[role=\"button\"]'))) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -320,7 +320,7 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
+            var nc = node.closest('.notify-user-container'); if (nc && (node.closest('button') || node.closest('[role=\"button\"]'))) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
@@ -443,7 +443,7 @@ export const RESPONSE_SELECTORS = {
         const isInsideExcludedContainer = (node) => {
             if (node.closest('details')) return true;
             if (node.closest('[class*="feedback"], footer')) return true;
-            if (node.closest('.notify-user-container')) return true;
+            var nc = node.closest('.notify-user-container'); if (nc && (node.closest('button') || node.closest('[role=\"button\"]'))) return true;
             if (node.closest('[role="dialog"]')) return true;
             return false;
         };
