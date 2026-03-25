@@ -54,7 +54,8 @@ export class ScheduleService {
         cronExpression: string,
         prompt: string,
         workspacePath: string,
-        jobCallback: JobCallback
+        jobCallback: JobCallback,
+        model?: string | null
     ): ScheduleRecord {
         // Validate cron expression
         if (!cron.validate(cronExpression)) {
@@ -67,6 +68,7 @@ export class ScheduleService {
             prompt,
             workspacePath,
             enabled: true,
+            model: model ?? null,
         });
 
         // Register with node-cron

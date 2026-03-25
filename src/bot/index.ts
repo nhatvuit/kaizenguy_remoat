@@ -1215,6 +1215,22 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       const projectName = bridge.pool.extractProjectName(schedule.workspacePath);
       bridge.lastActiveWorkspace = projectName;
 
+      // [KaizenGuy] Switch model nếu schedule có chỉ định model riêng
+      let previousModel: string | null = null;
+      if (schedule.model) {
+        try {
+          previousModel = await cdp.getCurrentModel();
+          const modelResult = await cdp.setUiModel(schedule.model);
+          if (modelResult.ok) {
+            logger.info(`[Schedule] Switched to model: ${schedule.model} (was: ${previousModel})`);
+          } else {
+            logger.warn(`[Schedule] Failed to switch model to ${schedule.model}: ${modelResult.error}. Using current model.`);
+          }
+        } catch (modelErr: any) {
+          logger.warn(`[Schedule] Model switch error: ${modelErr.message}. Using current model.`);
+        }
+      }
+
       // [KaizenGuy] Tạo chat mới trước khi gửi prompt — tránh đụng chat đang mở
       const newChatResult = await chatSessionService.startNewChat(cdp);
       if (newChatResult.ok) {
@@ -1228,18 +1244,30 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
       bridge.lastActiveChannel = scheduleCh;
 
-      await promptDispatcher.send({
-        channel: scheduleCh,
-        prompt: schedule.prompt,
-        cdp,
-        inboundImages: [],
-        options: {
-          chatSessionService,
-          chatSessionRepo,
-          topicManager,
-          titleGenerator,
-        },
-      });
+      try {
+        await promptDispatcher.send({
+          channel: scheduleCh,
+          prompt: schedule.prompt,
+          cdp,
+          inboundImages: [],
+          options: {
+            chatSessionService,
+            chatSessionRepo,
+            topicManager,
+            titleGenerator,
+          },
+        });
+      } finally {
+        // [KaizenGuy] Restore model cũ sau khi xong
+        if (previousModel && schedule.model) {
+          try {
+            await cdp.setUiModel(previousModel);
+            logger.info(`[Schedule] Restored model to: ${previousModel}`);
+          } catch (restoreErr: any) {
+            logger.warn(`[Schedule] Failed to restore model: ${restoreErr.message}`);
+          }
+        }
+      }
     } catch (e: any) {
       logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
       // Gửi thông báo lỗi qua Telegram
@@ -1651,25 +1679,23 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       for (const job of jobs) {
         const status = job.enabled ? "🟢" : "⚪";
         const promptPreview = job.prompt.length > 60 ? job.prompt.substring(0, 60) + "..." : job.prompt;
-        text += `${status} <b>#${job.id}</b> | <code>${escapeHtml(job.cronExpression)}</code>\n`;
+        const modelTag = job.model ? ` · 🤖 ${escapeHtml(job.model)}` : "";
+        text += `${status} <b>#${job.id}</b> | <code>${escapeHtml(job.cronExpression)}</code>${modelTag}\n`;
         text += `   <i>${escapeHtml(promptPreview)}</i>\n\n`;
       }
       text += `<i>Dùng /schedule add, /schedule remove, /schedule toggle</i>`;
       await replyHtml(ctx, text);
     } else if (subCmd === "add") {
-      // /schedule add <cron> | <prompt>
+      // /schedule add <cron> | <prompt> [| <model>]
       const rest = args.substring(4).trim();
-      const pipeIndex = rest.indexOf("|");
-      if (pipeIndex === -1) {
-        await ctx.reply("Usage: /schedule add <cron_expression> | <prompt>\nVD: /schedule add 0 9 * * * | Nhắc anh Vũ uống nước");
+      const pipeParts = rest.split("|").map(s => s.trim());
+      if (pipeParts.length < 2 || !pipeParts[0] || !pipeParts[1]) {
+        await ctx.reply("Usage: /schedule add <cron> | <prompt> [| <model>]\nVD: /schedule add 0 9 * * * | Nhắc anh Vũ | gemini-3-flash");
         return;
       }
-      const cronExpr = rest.substring(0, pipeIndex).trim();
-      const prompt = rest.substring(pipeIndex + 1).trim();
-      if (!cronExpr || !prompt) {
-        await ctx.reply("Cron expression và prompt không được trống.");
-        return;
-      }
+      const cronExpr = pipeParts[0];
+      const prompt = pipeParts[1];
+      const scheduleModel = pipeParts[2] || null; // optional model
       try {
         const ch = getChannel(ctx);
         const binding = workspaceBindingRepo.findByChannelId(channelKey(ch));
@@ -1680,16 +1706,35 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
             const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
             const projectName = bridge.pool.extractProjectName(schedule.workspacePath);
             bridge.lastActiveWorkspace = projectName;
+
+            // [KaizenGuy] Switch model nếu schedule có chỉ định
+            let previousModel: string | null = null;
+            if (schedule.model) {
+              try {
+                previousModel = await cdp.getCurrentModel();
+                await cdp.setUiModel(schedule.model);
+                logger.info(`[Schedule] Switched to model: ${schedule.model}`);
+              } catch (modelErr: any) {
+                logger.warn(`[Schedule] Model switch error: ${modelErr.message}`);
+              }
+            }
+
             const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
             const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
             bridge.lastActiveChannel = scheduleCh;
-            await promptDispatcher.send({
-              channel: scheduleCh,
-              prompt: schedule.prompt,
-              cdp,
-              inboundImages: [],
-              options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-            });
+            try {
+              await promptDispatcher.send({
+                channel: scheduleCh,
+                prompt: schedule.prompt,
+                cdp,
+                inboundImages: [],
+                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
+              });
+            } finally {
+              if (previousModel && schedule.model) {
+                try { await cdp.setUiModel(previousModel); } catch { /* best effort */ }
+              }
+            }
           } catch (e: any) {
             logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
             const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
@@ -1697,8 +1742,9 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
               bot.api.sendMessage(defaultChatId, `⚠️ Schedule job #${schedule.id} failed: ${e.message}`).catch(() => {});
             }
           }
-        });
-        await replyHtml(ctx, `✅ Schedule #${record.id} đã tạo\n<code>${escapeHtml(cronExpr)}</code>\n<i>${escapeHtml(prompt.substring(0, 100))}</i>`);
+        }, scheduleModel);
+        const modelInfo = scheduleModel ? `\n🤖 ${escapeHtml(scheduleModel)}` : "";
+        await replyHtml(ctx, `✅ Schedule #${record.id} đã tạo\n<code>${escapeHtml(cronExpr)}</code>\n<i>${escapeHtml(prompt.substring(0, 100))}</i>${modelInfo}`);
       } catch (e: any) {
         await ctx.reply(`❌ Lỗi: ${e.message}`);
       }
@@ -1733,7 +1779,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         scheduleService.removeSchedule(id);
         // Re-insert as disabled
         const db2 = db; // reuse same db reference
-        db2.prepare("INSERT INTO schedules (id, cron_expression, prompt, workspace_path, enabled) VALUES (?, ?, ?, ?, 0)").run(id, job.cronExpression, job.prompt, job.workspacePath);
+        db2.prepare("INSERT INTO schedules (id, cron_expression, prompt, workspace_path, enabled, model) VALUES (?, ?, ?, ?, 0, ?)").run(id, job.cronExpression, job.prompt, job.workspacePath, job.model ?? null);
         await ctx.reply(`⚪ Schedule #${id} đã tắt.`);
       } else {
         // Enable: delete disabled record, re-add as enabled
@@ -1758,7 +1804,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       await replyHtml(ctx,
         `<b>🕒 /schedule commands</b>\n\n` +
         `/schedule list — Xem danh sách\n` +
-        `/schedule add &lt;cron&gt; | &lt;prompt&gt; — Thêm mới\n` +
+        `/schedule add &lt;cron&gt; | &lt;prompt&gt; [| &lt;model&gt;] — Thêm mới\n` +
         `/schedule remove &lt;id&gt; — Xoá\n` +
         `/schedule toggle &lt;id&gt; — Bật/tắt`
       );
