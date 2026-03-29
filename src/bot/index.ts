@@ -1616,6 +1616,33 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     );
   });
 
+  // /quota command
+  bot.command("quota", async (ctx) => {
+    const ch = getChannel(ctx);
+    const resolved = await resolveWorkspaceAndCdp(ch);
+    const cdp = resolved?.cdp ?? getCurrentCdp(bridge);
+    if (!cdp) {
+      await ctx.reply("⚠️ Không thấy Antigravity nào. Anh mở anti lên trước rứa nghen.");
+      return;
+    }
+
+    const quotaPrompt = "Dùng browser_subagent mở UI Settings của Antigravity, chụp màn hình và đọc data % quota còn lại của các model hiện có, sau đó tóm tắt báo cáo trạng thái quota gọn gàng vô cái bảng.";
+    await ctx.reply("🔍 Đang nhét subagent chui vô UI đọc quota, anh Vũ đợi xíu nghen...");
+
+    await promptDispatcher.send({
+      channel: ch,
+      prompt: quotaPrompt,
+      cdp,
+      inboundImages: [],
+      options: {
+        chatSessionService,
+        chatSessionRepo,
+        topicManager,
+        titleGenerator,
+      },
+    });
+  });
+
   // /stop command
   bot.command("stop", async (ctx) => {
     const ch = getChannel(ctx);
@@ -3317,6 +3344,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
           { command: "model", description: "Change LLM model" },
           { command: "stop", description: "Interrupt active generation" },
           { command: "screenshot", description: "Capture Antigravity screen" },
+          { command: "quota", description: "Check model API quotas via UI" },
           { command: "template", description: "Show prompt templates" },
           { command: "template_add", description: "Register a template" },
           { command: "template_delete", description: "Delete a template" },
