@@ -788,11 +788,132 @@ export class ChatSessionService {
         return this.tryActivateWithScript(cdpService, buildActivateChatByTitleScript(title), false);
     }
 
+    // [KaizenGuy] Rewritten as multi-step CDP flow (2026-04-02).
+    // Old approach: single Runtime.evaluate script that did everything in JS,
+    // including setting input.value + dispatchEvent('input'). React controlled
+    // inputs ignore this → search never filters → clicks wrong row.
+    // New approach: CDP mouse click to open panel, CDP keyboard to type search,
+    // CDP mouse click to select the matching row.
     private async tryActivateByPastConversations(
         cdpService: CdpService,
         title: string,
     ): Promise<{ ok: boolean; error?: string }> {
-        return this.tryActivateWithScript(cdpService, buildActivateViaPastConversationsScript(title), true);
+        try {
+            // Step 1: Click the Past Conversations toggle button
+            const btnState = await this.evaluateOnAnyContext(
+                cdpService, FIND_PAST_CONVERSATIONS_BUTTON_SCRIPT, false,
+            );
+            if (!btnState?.found) {
+                return { ok: false, error: 'Past Conversations button not found' };
+            }
+            await this.cdpMouseClick(cdpService, btnState.x, btnState.y);
+            await new Promise((r) => setTimeout(r, 600));
+
+            // Step 2: Find the search input and focus it via CDP click
+            const inputCoords = await this.evaluateOnAnyContext(cdpService, `(() => {
+                const qp = document.querySelector('.jetski-fast-pick');
+                if (!qp) return null;
+                const input = qp.querySelector('input[type="text"], input[placeholder*="conversation"], input[placeholder*="search"]');
+                if (!input || input.offsetParent === null) return null;
+                const r = input.getBoundingClientRect();
+                return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+            })()`, false);
+
+            if (!inputCoords) {
+                // Close panel and bail
+                await this.cdpKeyPress(cdpService, 'Escape');
+                return { ok: false, error: 'Search input not found in Past Conversations panel' };
+            }
+
+            // Click input to focus
+            await this.cdpMouseClick(cdpService, inputCoords.x, inputCoords.y);
+            await new Promise((r) => setTimeout(r, 200));
+
+            // Step 3: Type search text via CDP keyboard events (real keystrokes)
+            for (const char of title) {
+                await cdpService.call('Input.dispatchKeyEvent', {
+                    type: 'keyDown', text: char, key: char,
+                    unmodifiedText: char,
+                });
+                await cdpService.call('Input.dispatchKeyEvent', {
+                    type: 'keyUp', key: char,
+                });
+                await new Promise((r) => setTimeout(r, 30));
+            }
+            await new Promise((r) => setTimeout(r, 400));
+
+            // Step 4: Find the matching row and click it
+            const safeTitle = JSON.stringify(title);
+            const rowCoords = await this.evaluateOnAnyContext(cdpService, `(() => {
+                const qp = document.querySelector('.jetski-fast-pick');
+                if (!qp) return { error: 'no quickpick' };
+                const container = qp.querySelector('.bg-quickinput-background') || qp;
+                const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+                const wanted = normalize(${safeTitle});
+                const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"][class*="flex"][class*="items-center"][class*="justify-between"]'));
+                const visibleRows = rows.filter(r => r.offsetParent !== null);
+                
+                // Try exact title match first (within span text)
+                for (const row of visibleRows) {
+                    const spans = row.querySelectorAll('span');
+                    for (const span of spans) {
+                        const t = normalize(span.textContent || '');
+                        if (t === wanted) {
+                            const rect = row.getBoundingClientRect();
+                            return { found: true, x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2), matchedText: t };
+                        }
+                    }
+                }
+                
+                // Fallback: includes match
+                for (const row of visibleRows) {
+                    const rowText = normalize(row.textContent || '');
+                    if (rowText.includes(wanted)) {
+                        const rect = row.getBoundingClientRect();
+                        return { found: true, x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2), matchedText: rowText.substring(0, 80) };
+                    }
+                }
+                
+                // If only 1 row visible after search, click it
+                if (visibleRows.length === 1) {
+                    const rect = visibleRows[0].getBoundingClientRect();
+                    return { found: true, x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2), matchedText: 'only-row: ' + normalize(visibleRows[0].textContent || '').substring(0, 80) };
+                }
+                
+                return { found: false, error: 'No matching row', visibleCount: visibleRows.length, visibleTitles: visibleRows.map(r => normalize(r.textContent || '').substring(0, 60)) };
+            })()`, false);
+
+            if (!rowCoords?.found) {
+                logger.warn(`[tryActivateByPastConversations] Row not found: ${JSON.stringify(rowCoords)}`);
+                await this.cdpKeyPress(cdpService, 'Escape');
+                return { ok: false, error: rowCoords?.error || 'Conversation row not found after search' };
+            }
+
+            logger.info(`[tryActivateByPastConversations] Clicking row: ${rowCoords.matchedText} at (${rowCoords.x}, ${rowCoords.y})`);
+            await this.cdpMouseClick(cdpService, rowCoords.x, rowCoords.y);
+            await new Promise((r) => setTimeout(r, 300));
+
+            return { ok: true };
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : String(error);
+            logger.error(`[tryActivateByPastConversations] Error: ${message}`);
+            // Try to close panel on error
+            try { await this.cdpKeyPress(cdpService, 'Escape'); } catch (_) {}
+            return { ok: false, error: message };
+        }
+    }
+
+    /**
+     * Press a key via CDP Input.dispatchKeyEvent.
+     */
+    private async cdpKeyPress(cdpService: CdpService, key: string): Promise<void> {
+        const keyCode = key === 'Escape' ? 27 : key === 'Enter' ? 13 : 0;
+        await cdpService.call('Input.dispatchKeyEvent', {
+            type: 'keyDown', key, code: key, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+        });
+        await cdpService.call('Input.dispatchKeyEvent', {
+            type: 'keyUp', key, code: key, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode,
+        });
     }
 
     private async tryActivateWithScript(
