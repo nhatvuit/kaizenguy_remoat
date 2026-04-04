@@ -16,6 +16,8 @@ export interface ScheduleRecord {
     enabled: boolean;
     /** LLM model to use (e.g. "gemini-3-flash"). null = use current model */
     model?: string | null;
+    /** Chat title to activate instead of creating new chat. null = create new chat */
+    chatTitle?: string | null;
     /** Creation timestamp (ISO string) */
     createdAt?: string;
 }
@@ -29,6 +31,7 @@ export interface CreateScheduleInput {
     workspacePath: string;
     enabled: boolean;
     model?: string | null;
+    chatTitle?: string | null;
 }
 
 /**
@@ -40,6 +43,7 @@ export interface UpdateScheduleInput {
     workspacePath?: string;
     enabled?: boolean;
     model?: string | null;
+    chatTitle?: string | null;
 }
 
 /**
@@ -61,7 +65,7 @@ export class ScheduleRepository {
         this.initialize();
 
         this.stmtCreate = this.db.prepare(
-            'INSERT INTO schedules (cron_expression, prompt, workspace_path, enabled, model) VALUES (?, ?, ?, ?, ?)'
+            'INSERT INTO schedules (cron_expression, prompt, workspace_path, enabled, model, chat_title) VALUES (?, ?, ?, ?, ?, ?)'
         );
         this.stmtFindAll = this.db.prepare(
             'SELECT * FROM schedules ORDER BY id ASC'
@@ -94,6 +98,10 @@ export class ScheduleRepository {
         if (!cols.some((c: any) => c.name === 'model')) {
             this.db.exec('ALTER TABLE schedules ADD COLUMN model TEXT');
         }
+        // Migration: add chat_title column if not exists
+        if (!cols.some((c: any) => c.name === 'chat_title')) {
+            this.db.exec('ALTER TABLE schedules ADD COLUMN chat_title TEXT');
+        }
     }
 
     public create(input: CreateScheduleInput): ScheduleRecord {
@@ -102,7 +110,8 @@ export class ScheduleRepository {
             input.prompt,
             input.workspacePath,
             input.enabled ? 1 : 0,
-            input.model ?? null
+            input.model ?? null,
+            input.chatTitle ?? null
         );
 
         return {
@@ -112,6 +121,7 @@ export class ScheduleRepository {
             workspacePath: input.workspacePath,
             enabled: input.enabled,
             model: input.model ?? null,
+            chatTitle: input.chatTitle ?? null,
         };
     }
 
@@ -163,6 +173,10 @@ export class ScheduleRepository {
             sets.push('model = ?');
             values.push(input.model);
         }
+        if (input.chatTitle !== undefined) {
+            sets.push('chat_title = ?');
+            values.push(input.chatTitle);
+        }
 
         if (sets.length === 0) return false;
 
@@ -180,6 +194,7 @@ export class ScheduleRepository {
             workspacePath: row.workspace_path,
             enabled: row.enabled === 1,
             model: row.model ?? null,
+            chatTitle: row.chat_title ?? null,
             createdAt: row.created_at,
         };
     }

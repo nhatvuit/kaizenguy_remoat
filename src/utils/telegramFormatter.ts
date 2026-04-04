@@ -107,7 +107,55 @@ export function formatForTelegram(text: string): string {
             /^\s*[│├└]\s*──/.test(line) ||
             /^\s*\|.*──/.test(line);
 
-        const isSpecialLine = isTableLine || isTreeLine;
+        // [KaizenGuy] Convert markdown tables to vertical list format for Telegram mobile.
+        // Collect all consecutive table lines, parse headers + rows, emit as list.
+        if (isTableLine && !isTreeLine) {
+            // Start collecting table lines
+            const tableLines: string[] = [trimmed];
+            while (i + 1 < lines.length) {
+                const nextTrimmed = lines[i + 1].trim();
+                const nextIsTable =
+                    (nextTrimmed.startsWith('|') && nextTrimmed.endsWith('|') && nextTrimmed.length > 2) ||
+                    /^\|[\s\-:]+\|/.test(nextTrimmed);
+                if (!nextIsTable) break;
+                tableLines.push(nextTrimmed);
+                i++;
+            }
+
+            // Parse table: extract headers and data rows
+            const parseCells = (row: string): string[] =>
+                row.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+
+            const headers: string[] = [];
+            const dataRows: string[][] = [];
+            for (const tl of tableLines) {
+                // Skip separator lines (|---|---|)
+                if (/^\|[\s\-:]+\|/.test(tl) && !/[a-zA-Z0-9\u00C0-\u024F\u1E00-\u1EFF]/.test(tl)) continue;
+                const cells = parseCells(tl);
+                if (headers.length === 0) {
+                    headers.push(...cells);
+                } else {
+                    dataRows.push(cells);
+                }
+            }
+
+            // Emit as vertical list
+            if (inSpecialBlock) {
+                result.push('</pre>');
+                inSpecialBlock = false;
+            }
+            for (const row of dataRows) {
+                result.push(`📌 <b>${escapeHtml(row[0] || '')}</b>`);
+                for (let ci = 1; ci < row.length; ci++) {
+                    const header = headers[ci] || `Col ${ci + 1}`;
+                    result.push(`• ${escapeHtml(header)}: ${escapeHtml(row[ci] || '')}`);
+                }
+                result.push('');
+            }
+            continue;
+        }
+
+        const isSpecialLine = isTreeLine;
 
         // Blockquote lines: > text
         if (trimmed.startsWith('>') && !isSpecialLine) {

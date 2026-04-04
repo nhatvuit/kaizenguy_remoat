@@ -124,7 +124,7 @@ export function htmlToTelegramHtml(html: string): string {
     );
     result = result.replace(/<figure[^>]*>([\s\S]*?)<\/figure>/gi, '$1');
 
-    // Convert HTML tables to monospace ASCII tables inside <pre>
+    // [KaizenGuy] Convert HTML tables to vertical list format for Telegram mobile
     result = result.replace(
         /<table[^>]*>([\s\S]*?)<\/table>/gi,
         (_m, tableContent) => {
@@ -142,22 +142,19 @@ export function htmlToTelegramHtml(html: string): string {
             }
             if (rows.length === 0) return '';
 
-            const colCount = Math.max(...rows.map(r => r.length));
-            const colWidths: number[] = [];
-            for (let c = 0; c < colCount; c++) {
-                colWidths[c] = Math.max(...rows.map(r => (r[c] || '').length), 1);
-            }
-
-            const lines: string[] = [];
-            for (let ri = 0; ri < rows.length; ri++) {
-                const row = rows[ri];
-                const cells = row.map((cell, ci) => cell.padEnd(colWidths[ci]));
-                lines.push('| ' + cells.join(' | ') + ' |');
-                if (ri === 0) {
-                    lines.push('|' + colWidths.map(w => '-'.repeat(w + 2)).join('|') + '|');
+            // First row = headers
+            const headers = rows[0];
+            const dataRows = rows.slice(1);
+            const lines: string[] = [''];
+            for (const row of dataRows) {
+                lines.push(`📌 <b>${row[0] || ''}</b>`);
+                for (let ci = 1; ci < row.length; ci++) {
+                    const header = headers[ci] || `Col ${ci + 1}`;
+                    lines.push(`• ${header}: ${row[ci] || ''}`);
                 }
+                lines.push('');
             }
-            return `\n<pre>${lines.join('\n')}</pre>\n`;
+            return lines.join('\n');
         },
     );
 

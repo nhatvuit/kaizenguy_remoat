@@ -1072,7 +1072,11 @@ async function sendPromptToAntigravity(
             }
           }
 
-          await sendGeneratedImages(finalOutputText || "");
+          // [KaizenGuy] Skip image extraction when user attached images — DOM shows
+          // the attached images and they'd be sent back as "Generated image"
+          if (inboundImages.length === 0) {
+            await sendGeneratedImages(finalOutputText || "");
+          }
         } catch (error) {
           logger.error(
             `[sendPrompt:${monitorTraceId}] onComplete failed:`,
@@ -1231,12 +1235,27 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         }
       }
 
-      // [KaizenGuy] Tạo chat mới trước khi gửi prompt — tránh đụng chat đang mở
-      const newChatResult = await chatSessionService.startNewChat(cdp);
-      if (newChatResult.ok) {
-        logger.info(`[Schedule] New chat created for job #${schedule.id}`);
+      // [KaizenGuy] Activate existing chat or create new one
+      if (schedule.chatTitle) {
+        const activateResult = await chatSessionService.activateSessionByTitle(cdp, schedule.chatTitle);
+        if (activateResult.ok) {
+          logger.info(`[Schedule] Activated chat "${schedule.chatTitle}" for job #${schedule.id}`);
+        } else {
+          logger.warn(`[Schedule] Could not activate chat "${schedule.chatTitle}" for job #${schedule.id}: ${activateResult.error}. Falling back to new chat.`);
+          const newChatResult = await chatSessionService.startNewChat(cdp);
+          if (newChatResult.ok) {
+            logger.info(`[Schedule] Fallback: new chat created for job #${schedule.id}`);
+          } else {
+            logger.warn(`[Schedule] Fallback new chat also failed: ${newChatResult.error}. Proceeding with current chat.`);
+          }
+        }
       } else {
-        logger.warn(`[Schedule] Could not create new chat for job #${schedule.id}: ${newChatResult.error}. Proceeding with current chat.`);
+        const newChatResult = await chatSessionService.startNewChat(cdp);
+        if (newChatResult.ok) {
+          logger.info(`[Schedule] New chat created for job #${schedule.id}`);
+        } else {
+          logger.warn(`[Schedule] Could not create new chat for job #${schedule.id}: ${newChatResult.error}. Proceeding with current chat.`);
+        }
       }
 
       // Dùng channel mặc định (chat chính của owner)
@@ -3335,8 +3354,6 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       );
       try {
         await bot.api.setMyCommands([
-          { command: "start", description: "Welcome message" },
-          { command: "help", description: "Show all commands" },
           { command: "project", description: "Select a project" },
           { command: "new", description: "Start a new chat session" },
           { command: "chat", description: "Current session info" },
@@ -3344,12 +3361,7 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
           { command: "model", description: "Change LLM model" },
           { command: "stop", description: "Interrupt active generation" },
           { command: "screenshot", description: "Capture Antigravity screen" },
-          { command: "quota", description: "Check model API quotas via UI" },
-          { command: "template", description: "Show prompt templates" },
-          { command: "template_add", description: "Register a template" },
-          { command: "template_delete", description: "Delete a template" },
           { command: "autoaccept", description: "Toggle auto-approve mode" },
-          { command: "status", description: "Bot status overview" },
           { command: "ping", description: "Check latency" },
         ]);
         logger.info("Telegram command menu registered successfully");
