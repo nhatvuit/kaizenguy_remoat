@@ -90,9 +90,12 @@ export async function buildModelsUI(
         const exhausted = isExhausted(mName);
         const safeName = mName.length > 40 ? mName.substring(0, 37) + '...' : mName;
         const label = exhausted ? `⛔ ${safeName}` : safeName;
-        const maxNameLen = 64 - 'model_exhausted_'.length;
-        const cbName = mName.length > maxNameLen ? mName.substring(0, maxNameLen) : mName;
-        const cbData = exhausted ? `model_exhausted_${cbName}` : `model_btn_${cbName}`;
+        const cbPrefix = exhausted ? 'model_exhausted_' : 'model_btn_';
+        let cbName = mName;
+        while (Buffer.byteLength(cbPrefix + cbName, 'utf-8') > 64) {
+            cbName = cbName.slice(0, -1);
+        }
+        const cbData = cbPrefix + cbName;
         keyboard.text(label, cbData).row();
     }
     keyboard.text('🔄 Refresh', 'model_refresh_btn').row();

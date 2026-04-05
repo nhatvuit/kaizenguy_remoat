@@ -31,7 +31,13 @@ export function buildSessionPickerUI(
         const label = session.isActive
             ? `✅ ${session.title.slice(0, 40)}`
             : session.title.slice(0, 40);
-        keyboard.text(label, `${SESSION_SELECT_ID}:${session.title.slice(0, 49)}`).row();
+        // Telegram callback_data limit is 64 bytes. SESSION_SELECT_ID + ':' takes 15 bytes.
+        // That leaves 49 bytes. Truncate strictly by UTF-8 byte length.
+        let payloadText = session.title;
+        while (Buffer.byteLength(payloadText, 'utf-8') > 48) {
+            payloadText = payloadText.slice(0, -1);
+        }
+        keyboard.text(label, `${SESSION_SELECT_ID}:${payloadText}`).row();
     }
 
     return { text, keyboard };

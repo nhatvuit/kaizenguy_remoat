@@ -3354,12 +3354,12 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
       );
       try {
         await bot.api.setMyCommands([
-          { command: "project", description: "Select a project" },
-          { command: "new", description: "Start a new chat session" },
           { command: "chat", description: "Current session info" },
-          { command: "mode", description: "Change execution mode" },
+          { command: "new", description: "Start a new chat session" },
           { command: "model", description: "Change LLM model" },
           { command: "stop", description: "Interrupt active generation" },
+          { command: "project", description: "Select a project" },
+          { command: "mode", description: "Change execution mode" },
           { command: "screenshot", description: "Capture Antigravity screen" },
           { command: "autoaccept", description: "Toggle auto-approve mode" },
           { command: "ping", description: "Check latency" },
