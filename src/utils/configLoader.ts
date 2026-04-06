@@ -21,6 +21,7 @@ export interface PersistedConfig {
     useTopics?: boolean;
     disableProgressLog?: boolean;
     enableTelegramHint?: boolean;
+    forumGroupId?: number;
 }
 
 function getConfigDir(): string {
@@ -100,6 +101,10 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         true,
     );
 
+    const forumGroupId = persisted.forumGroupId
+        ? Number(persisted.forumGroupId)
+        : null;
+
     return {
         telegramBotToken: token,
         allowedUserIds,
@@ -110,6 +115,7 @@ function mergeConfig(persisted: PersistedConfig): AppConfig {
         useTopics,
         disableProgressLog,
         enableTelegramHint,
+        forumGroupId,
     };
 }
 

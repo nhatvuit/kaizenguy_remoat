@@ -61,12 +61,35 @@ export function startNotificationService(
           return;
         }
 
-        // Send to all allowed chat IDs
+        // [KaizenGuy] Support topic_id for forum routing
+        const topicId = data.topic_id ? Number(data.topic_id) : undefined;
+        const targetChatId = data.chat_id ? Number(data.chat_id) : undefined;
+
+        // If chat_id + topic_id specified, send to specific forum topic
+        if (targetChatId && topicId) {
+          try {
+            await botApi.sendMessage(targetChatId, message, {
+              parse_mode: data.parse_mode || 'HTML',
+              message_thread_id: topicId,
+            });
+            logger.info(`[NotifyService] Sent to forum topic ${topicId} in ${targetChatId}`);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, target: { chatId: targetChatId, topicId } }));
+          } catch (err: any) {
+            logger.error(`[NotifyService] Failed to send to topic ${topicId}:`, err?.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: err?.message }));
+          }
+          return;
+        }
+
+        // Default: send to all allowed chat IDs (original behavior)
         const results = [];
         for (const chatId of allowedChatIds) {
           try {
             await botApi.sendMessage(chatId, message, {
               parse_mode: data.parse_mode || 'HTML',
+              message_thread_id: topicId,
             });
             results.push({ chatId, sent: true });
           } catch (err: any) {

@@ -12,6 +12,7 @@ export interface ChatSessionRecord {
     displayName: string | null;
     isRenamed: boolean;
     guildId: string;
+    topicId: number | null;
     createdAt?: string;
 }
 
@@ -41,6 +42,9 @@ export class ChatSessionRepository {
     private readonly stmtUpdateDisplayName: Database.Statement;
     private readonly stmtFindByDisplayName: Database.Statement;
     private readonly stmtDeleteByChannelId: Database.Statement;
+    private readonly stmtFindByTopicId: Database.Statement;
+    private readonly stmtFindAllByGuildId: Database.Statement;
+    private readonly stmtUpsertByTopicId: Database.Statement;
 
     constructor(db: Database.Database) {
         this.db = db;
@@ -67,6 +71,17 @@ export class ChatSessionRepository {
         this.stmtDeleteByChannelId = this.db.prepare(
             'DELETE FROM chat_sessions WHERE channel_id = ?'
         );
+        this.stmtFindByTopicId = this.db.prepare(
+            'SELECT * FROM chat_sessions WHERE topic_id = ? ORDER BY id DESC LIMIT 1'
+        );
+        this.stmtFindAllByGuildId = this.db.prepare(
+            'SELECT * FROM chat_sessions WHERE guild_id = ? ORDER BY id DESC'
+        );
+        this.stmtUpsertByTopicId = this.db.prepare(
+            `INSERT INTO chat_sessions (channel_id, category_id, workspace_path, session_number, display_name, is_renamed, guild_id, topic_id)
+             VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+             ON CONFLICT(channel_id) DO UPDATE SET display_name = excluded.display_name, topic_id = excluded.topic_id`
+        );
     }
 
     private initialize(): void {
@@ -80,9 +95,14 @@ export class ChatSessionRepository {
                 display_name TEXT,
                 is_renamed INTEGER NOT NULL DEFAULT 0,
                 guild_id TEXT NOT NULL,
+                topic_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         `);
+        // Migration: add topic_id column if missing
+        try {
+            this.db.exec('ALTER TABLE chat_sessions ADD COLUMN topic_id INTEGER');
+        } catch { /* column already exists */ }
     }
 
     public create(input: CreateChatSessionInput): ChatSessionRecord {
@@ -103,6 +123,7 @@ export class ChatSessionRepository {
             displayName: null,
             isRenamed: false,
             guildId: input.guildId,
+            topicId: null,
         };
     }
 
@@ -148,6 +169,43 @@ export class ChatSessionRepository {
         return result.changes > 0;
     }
 
+    /**
+     * Find session by Telegram Forum topic_id.
+     */
+    public findByTopicId(topicId: number): ChatSessionRecord | undefined {
+        const row = this.stmtFindByTopicId.get(topicId) as any;
+        if (!row) return undefined;
+        return this.mapRow(row);
+    }
+
+    /**
+     * Find all sessions for a given guild (group).
+     */
+    public findAllByGuildId(guildId: string): ChatSessionRecord[] {
+        const rows = this.stmtFindAllByGuildId.all(guildId) as any[];
+        return rows.map(row => this.mapRow(row));
+    }
+
+    /**
+     * Upsert a session record keyed by topic_id.
+     * Used by /chat_sync to create mappings for forum topics.
+     */
+    public upsertByTopicId(
+        channelId: string,
+        categoryId: string,
+        workspacePath: string,
+        sessionNumber: number,
+        displayName: string,
+        guildId: string,
+        topicId: number,
+    ): ChatSessionRecord {
+        this.stmtUpsertByTopicId.run(
+            channelId, categoryId, workspacePath, sessionNumber,
+            displayName, guildId, topicId,
+        );
+        return this.findByChannelId(channelId)!;
+    }
+
     private mapRow(row: any): ChatSessionRecord {
         return {
             id: row.id,
@@ -158,6 +216,7 @@ export class ChatSessionRepository {
             displayName: row.display_name,
             isRenamed: row.is_renamed === 1,
             guildId: row.guild_id,
+            topicId: row.topic_id ?? null,
             createdAt: row.created_at,
         };
     }

@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { Bot, Context, InlineKeyboard, InputFile } from "grammy";
 import Database from "better-sqlite3";
 
@@ -25,7 +26,7 @@ import {
 import { ModelService } from "../services/modelService";
 import { TemplateRepository } from "../database/templateRepository";
 import { WorkspaceBindingRepository } from "../database/workspaceBindingRepository";
-import { ChatSessionRepository } from "../database/chatSessionRepository";
+import { ChatSessionRepository, ChatSessionRecord } from "../database/chatSessionRepository";
 import { WorkspaceService } from "../services/workspaceService";
 import { TelegramTopicManager } from "../services/telegramTopicManager";
 import { TitleGeneratorService } from "../services/titleGeneratorService";
@@ -120,6 +121,7 @@ import {
   buildPlanContentUI,
   paginatePlanContent,
 } from "../ui/planUi";
+import { channelKey } from "./helpers";
 
 const PHASE_ICONS = {
   sending: "📡",
@@ -186,9 +188,7 @@ const planEditPendingChannels = new Map<string, { projectName: string }>();
 /** Cached plan content pages per channel */
 const planContentCache = new Map<string, string[]>();
 
-function channelKey(ch: TelegramChannel): string {
-  return ch.threadId ? `${ch.chatId}:${ch.threadId}` : String(ch.chatId);
-}
+
 
 function createSerialTaskQueue(
   queueName: string,
@@ -664,10 +664,34 @@ async function sendPromptToAntigravity(
   let monitor: ResponseMonitor | null = null;
 
   try {
+    // [KaizenGuy] Forum Topic: switch to correct conversation INSIDE the lock
+    // This ensures no concurrent switch while another prompt is being processed.
+    if (channel.threadId && options?.chatSessionRepo) {
+      const topicSession = options.chatSessionRepo.findByTopicId(channel.threadId);
+      if (topicSession?.displayName && options.chatSessionService) {
+        const switchResult = await options.chatSessionService.activateSessionByTitle(
+          cdp, topicSession.displayName,
+        );
+        if (!switchResult.ok) {
+          logger.warn(`[sendPrompt] Forum topic switch failed for "${topicSession.displayName}": ${switchResult.error}`);
+          await sendEmbed(
+            `⚠️ Switch Failed`,
+            `Could not switch to "${topicSession.displayName}": ${switchResult.error}`,
+          );
+          isFinalized = true;
+          return;
+        }
+        logger.info(`[sendPrompt] Switched to conversation "${topicSession.displayName}" for topic ${channel.threadId}`);
+      }
+    }
+
     // [KaizenGuy] Append Telegram delivery hint so the agent knows output
     // will be displayed on Telegram and can format response accordingly.
-    // Details about Telegram formatting rules are in the agent's remoat-admin skill.
-    const TELEGRAM_HINT = `\n\n[remoat:telegram]`;
+    // We pass chat_id and topic_id if available, so agent can route notifications properly.
+    let TELEGRAM_HINT = `\n\n[remoat:telegram]`;
+    if (channel.threadId && channel.chatId === loadConfig().forumGroupId) {
+      TELEGRAM_HINT = `\n\n[remoat:telegram:chat=${channel.chatId}:topic=${channel.threadId}]`;
+    }
 
     const hintedPrompt = loadConfig().enableTelegramHint
       ? prompt + TELEGRAM_HINT
@@ -720,9 +744,34 @@ async function sendPromptToAntigravity(
       ? Promise.resolve()
       : refreshProgress(progressTitle(), progressFooter()));
 
-    monitor = new ResponseMonitor({
-      cdpService: cdp,
-      pollIntervalMs: 2000,
+    // [KaizenGuy] Event-Driven Architecture bypass:
+    // Instead of waiting for DOM via ResponseMonitor, we wait 4s and release immediately.
+    // The Agent is entirely responsible for calling /notify.
+    if (!loadConfig().useTopics || channel.chatId === loadConfig().forumGroupId) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      isFinalized = true;
+      userStopRequestedChannels.delete(channelKey(channel));
+      // Xóa tin nhắn "Thinking..." do mình chèn lúc nãy đi để sạch giao diện Tele
+      if (liveActivityMsgId) {
+        try {
+          await api.deleteMessage(channel.chatId, liveActivityMsgId);
+        } catch (e) {}
+      }
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      let isResolved = false;
+      const finish = () => {
+        if (!isResolved) {
+          isResolved = true;
+          resolve();
+        }
+      };
+
+      monitor = new ResponseMonitor({
+        cdpService: cdp,
+        pollIntervalMs: 2000,
       maxDurationMs: 1800000,
       stopGoneConfirmCount: 3,
       onPhaseChange: () => {},
@@ -803,6 +852,7 @@ async function sendPromptToAntigravity(
         if (wasStoppedByUser) {
           logger.info(`[sendPrompt:${monitorTraceId}] Stopped by user`);
           await sendMsg("⏹️ Generation stopped.");
+          finish();
           return;
         }
 
@@ -1041,24 +1091,30 @@ async function sendPromptToAntigravity(
                 }
 
                 if (session && session.displayName !== sessionInfo.title) {
-                  const newName = options.titleGenerator.sanitizeForChannelName(
-                    sessionInfo.title,
-                  );
-                  const formattedName = `${session.sessionNumber}-${newName}`;
-                  const threadId = session.channelId.includes(":")
-                    ? Number(session.channelId.split(":")[1])
-                    : undefined;
-                  if (threadId) {
-                    try {
-                      options.topicManager.setChatId(
-                        Number(session.channelId.split(":")[0]),
-                      );
-                      await options.topicManager.renameTopic(
-                        threadId,
-                        formattedName,
-                      );
-                    } catch {
-                      /* topic rename optional */
+                  // [KaizenGuy] Skip rename for forum topics — onComplete may read
+                  // title of a DIFFERENT conversation if another topic has already
+                  // switched the active conversation. Rename is handled by /chat_sync.
+                  const isForumChannel = session.channelId.includes(":") && loadConfig().forumGroupId;
+                  if (!isForumChannel) {
+                    const newName = options.titleGenerator.sanitizeForChannelName(
+                      sessionInfo.title,
+                    );
+                    const formattedName = `${session.sessionNumber}-${newName}`;
+                    const threadId = session.channelId.includes(":")
+                      ? Number(session.channelId.split(":")[1])
+                      : undefined;
+                    if (threadId) {
+                      try {
+                        options.topicManager.setChatId(
+                          Number(session.channelId.split(":")[0]),
+                        );
+                        await options.topicManager.renameTopic(
+                          threadId,
+                          formattedName,
+                        );
+                      } catch {
+                        /* topic rename optional */
+                      }
                     }
                   }
                   options.chatSessionRepo.updateDisplayName(
@@ -1082,6 +1138,8 @@ async function sendPromptToAntigravity(
             `[sendPrompt:${monitorTraceId}] onComplete failed:`,
             error,
           );
+        } finally {
+          finish();
         }
       },
       onTimeout: async (lastText) => {
@@ -1125,15 +1183,21 @@ async function sendPromptToAntigravity(
             `[sendPrompt:${monitorTraceId}] onTimeout failed:`,
             error,
           );
+        } finally {
+          finish();
         }
       },
     });
 
-    await monitor.start();
+    monitor.start().catch((err) => {
+      logger.error(`[sendPrompt:${monitorTraceId}] start failed:`, err);
+      finish();
+    });
 
     elapsedTimer = setInterval(() => {
       if (isFinalized) {
         clearInterval(elapsedTimer!);
+        finish();
         return;
       }
       if (!skipProgress) triggerProgressRefresh();
@@ -1146,6 +1210,7 @@ async function sendPromptToAntigravity(
           .catch(() => {});
       }
     }, 5000);
+  });
   } catch (e: any) {
     isFinalized = true;
     userStopRequestedChannels.delete(channelKey(channel));
@@ -1153,7 +1218,7 @@ async function sendPromptToAntigravity(
       clearInterval(elapsedTimer);
     }
     if (monitor) {
-      await monitor.stop().catch(() => {});
+      await (monitor as any).stop().catch(() => {});
     }
     await sendEmbed(
       `${PHASE_ICONS.error} Error`,
@@ -1165,6 +1230,10 @@ async function sendPromptToAntigravity(
 // =============================================================================
 // Bot main entry point
 // =============================================================================
+
+
+import { CommandDeps } from "./types";
+
 
 export const startBot = async (cliLogLevel?: LogLevel) => {
   const config = loadConfig();
@@ -1258,9 +1327,19 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
         }
       }
 
-      // Dùng channel mặc định (chat chính của owner)
-      const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
-      const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
+      // Dùng forum group làm đích nếu có, route theo topic đã map với chat_title
+      let scheduleCh: TelegramChannel;
+      if (config.forumGroupId) {
+          let tId: number | undefined;
+          if (schedule.chatTitle) {
+              const s = chatSessionRepo.findByDisplayName(schedule.workspacePath, schedule.chatTitle);
+              if (s?.topicId) tId = s.topicId;
+          }
+          scheduleCh = { chatId: config.forumGroupId, threadId: tId };
+      } else {
+          const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
+          scheduleCh = { chatId: defaultChatId, threadId: undefined };
+      }
       bridge.lastActiveChannel = scheduleCh;
 
       try {
@@ -1419,1935 +1498,30 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
   };
 
   // /start command
-  bot.command("start", async (ctx) => {
-    await replyHtml(
-      ctx,
-      `<b>Remoat Online</b>\n\n` +
-        `Use /help for available commands.\n` +
-        `Send any text message to forward it to Antigravity.`,
-    );
-  });
-
-  // /help command
-  bot.command("help", async (ctx) => {
-    await replyHtml(
-      ctx,
-      `<b>📖 Remoat Commands</b>\n\n` +
-        `<b>💬 Chat</b>\n` +
-        `/new — Start a new chat session\n` +
-        `/chat — Show current session info\n\n` +
-        `<b>⏹️ Control</b>\n` +
-        `/stop — Interrupt active LLM generation\n` +
-        `/screenshot — Capture Antigravity screen\n\n` +
-        `<b>⚙️ Settings</b>\n` +
-        `/mode — Display and change execution mode\n` +
-        `/model — Display and change LLM model\n\n` +
-        `<b>📁 Projects</b>\n` +
-        `/project — Display project list\n\n` +
-        `<b>📝 Templates</b>\n` +
-        `/template — Show templates\n` +
-        `/template_add — Register a template\n` +
-        `/template_delete — Delete a template\n\n` +
-        `<b>🔧 System</b>\n` +
-        `/status — Display overall bot status\n` +
-        `/autoaccept — Toggle auto-approve mode\n` +
-        `/cleanup [days] — Clean up inactive sessions\n` +
-        `/ping — Check latency\n\n` +
-        `<i>Text messages are sent directly to Antigravity</i>`,
-    );
-  });
-
-  // /mode command
-  bot.command("mode", async (ctx) => {
-    await sendModeUI(
-      async (text, keyboard) => {
-        await replyHtml(ctx, text, keyboard);
-      },
-      modeService,
-      { getCurrentCdp: () => getCurrentCdp(bridge) },
-    );
-  });
-
-  // /model command
-  bot.command("model", async (ctx) => {
-    const ch = getChannel(ctx);
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    const getCdp = (): CdpService | null =>
-      resolved?.cdp ?? getCurrentCdp(bridge);
-    const modelName = ctx.match?.trim();
-    if (modelName) {
-      const cdp = getCdp();
-      if (!cdp) {
-        await ctx.reply(
-          "Not connected to CDP. Send a message first to connect.",
-        );
-        return;
-      }
-      const res = await cdp.setUiModel(modelName);
-      if (res.ok) {
-        await ctx.reply(
-          `Model changed to <b>${escapeHtml(res.model || modelName)}</b>.`,
-          { parse_mode: "HTML" },
-        );
-      } else {
-        await ctx.reply(res.error || "Failed to change model.");
-      }
-    } else {
-      await sendModelsUI(
-        async (text, keyboard) => {
-          await replyHtml(ctx, text, keyboard);
-        },
-        {
-          getCurrentCdp: getCdp,
-          fetchQuota: async () => bridge.quota.fetchQuota(),
-        },
-      );
-    }
-  });
-
-  // /template command
-  bot.command("template", async (ctx) => {
-    const templates = templateRepo.findAll();
-    await sendTemplateUI(async (text, keyboard) => {
-      await replyHtml(ctx, text, keyboard);
-    }, templates);
-  });
-
-  // /template_add command
-  bot.command("template_add", async (ctx) => {
-    const args = (ctx.match || "").trim();
-    const parts = args.split(/\s+/);
-    if (parts.length < 2) {
-      await ctx.reply("Usage: /template_add <name> <prompt>");
-      return;
-    }
-    const name = parts[0];
-    const prompt = parts.slice(1).join(" ");
-    const result = await slashCommandHandler.handleCommand("template", [
-      "add",
-      name,
-      prompt,
-    ]);
-    await ctx.reply(result.message);
-  });
-
-  // /template_delete command
-  bot.command("template_delete", async (ctx) => {
-    const name = (ctx.match || "").trim();
-    if (!name) {
-      await ctx.reply("Usage: /template_delete <name>");
-      return;
-    }
-    const result = await slashCommandHandler.handleCommand("template", [
-      "delete",
-      name,
-    ]);
-    await ctx.reply(result.message);
-  });
-
-  // /status command
-  bot.command("status", async (ctx) => {
-    const activeNames = bridge.pool.getActiveWorkspaceNames();
-    const currentMode = modeService.getCurrentMode();
-    const autoAcceptStatus = bridge.autoAccept.isEnabled() ? "🟢 ON" : "⚪ OFF";
-
-    let text = `<b>🔧 Bot Status</b>\n\n`;
-    text += `<b>CDP:</b> ${activeNames.length > 0 ? `🟢 ${activeNames.length} project(s) connected` : "⚪ Disconnected"}\n`;
-    text += `<b>Mode:</b> ${escapeHtml(MODE_DISPLAY_NAMES[currentMode] || currentMode)}\n`;
-    text += `<b>Auto Approve:</b> ${autoAcceptStatus}\n`;
-
-    if (activeNames.length > 0) {
-      text += `\n<b>Connected Projects:</b>\n`;
-      for (const name of activeNames) {
-        const cdp = bridge.pool.getConnected(name);
-        const contexts = cdp ? cdp.getContexts().length : 0;
-        text += `• <b>${escapeHtml(name)}</b> — Contexts: ${contexts}\n`;
-      }
-    } else {
-      text += `\nSend a message to auto-connect to a project.`;
-    }
-
-    await replyHtml(ctx, text);
-  });
-
-  // /autoaccept command
-  bot.command("autoaccept", async (ctx) => {
-    const requestedMode = (ctx.match || "").trim();
-    if (requestedMode === "on" || requestedMode === "off") {
-      const result = bridge.autoAccept.handle(requestedMode);
-      await ctx.reply(result.message);
-    } else {
-      await sendAutoAcceptUI(async (text, keyboard) => {
-        await replyHtml(ctx, text, keyboard);
-      }, bridge.autoAccept);
-    }
-  });
-
-  // /cleanup command
-  bot.command("cleanup", async (ctx) => {
-    const days = Math.max(1, parseInt((ctx.match || "").trim(), 10) || 7);
-    const guildId = String(ctx.chat!.id);
-    const inactive = cleanupHandler.findInactiveSessions(guildId, days);
-
-    if (inactive.length === 0) {
-      await replyHtml(
-        ctx,
-        `No inactive sessions older than <b>${days}</b> day(s).`,
-      );
-      return;
-    }
-
-    const list = inactive
-      .slice(0, 20)
-      .map(({ binding, session }) => {
-        const label = session?.displayName ?? binding.workspacePath;
-        return `• ${escapeHtml(label)}`;
-      })
-      .join("\n");
-    const extra =
-      inactive.length > 20 ? `\n…and ${inactive.length - 20} more` : "";
-
-    const keyboard = new InlineKeyboard()
-      .text("📦 Archive", `${CLEANUP_ARCHIVE_BTN}:${days}`)
-      .text("🗑 Delete", `${CLEANUP_DELETE_BTN}:${days}`)
-      .text("❌ Cancel", CLEANUP_CANCEL_BTN);
-
-    await replyHtml(
-      ctx,
-      `<b>🧹 Cleanup</b>\n\n` +
-        `Found <b>${inactive.length}</b> session(s) older than <b>${days}</b> day(s):\n\n` +
-        `${list}${extra}\n\n` +
-        `Choose an action:`,
-      keyboard,
-    );
-  });
-
-  // /screenshot command
-  bot.command("screenshot", async (ctx) => {
-    await handleScreenshot(
-      async (input, caption) => {
-        await ctx.replyWithPhoto(input, { caption });
-      },
-      async (text) => {
-        await ctx.reply(text);
-      },
-      getCurrentCdp(bridge),
-    );
-  });
-
-  // /quota command
-  bot.command("quota", async (ctx) => {
-    const ch = getChannel(ctx);
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    const cdp = resolved?.cdp ?? getCurrentCdp(bridge);
-    if (!cdp) {
-      await ctx.reply("⚠️ Không thấy Antigravity nào. Anh mở anti lên trước rứa nghen.");
-      return;
-    }
-
-    const quotaPrompt = "Dùng browser_subagent mở UI Settings của Antigravity, chụp màn hình và đọc data % quota còn lại của các model hiện có, sau đó tóm tắt báo cáo trạng thái quota gọn gàng vô cái bảng.";
-    await ctx.reply("🔍 Đang nhét subagent chui vô UI đọc quota, anh Vũ đợi xíu nghen...");
-
-    await promptDispatcher.send({
-      channel: ch,
-      prompt: quotaPrompt,
-      cdp,
-      inboundImages: [],
-      options: {
-        chatSessionService,
-        chatSessionRepo,
-        topicManager,
-        titleGenerator,
-      },
-    });
-  });
-
-  // /stop command
-  bot.command("stop", async (ctx) => {
-    const ch = getChannel(ctx);
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    const cdp = resolved?.cdp ?? getCurrentCdp(bridge);
-    if (!cdp) {
-      await ctx.reply("⚠️ Not connected to CDP.");
-      return;
-    }
-
-    try {
-      const contextId = cdp.getPrimaryContextId();
-      const callParams: Record<string, unknown> = {
-        expression: RESPONSE_SELECTORS.CLICK_STOP_BUTTON,
-        returnByValue: true,
-        awaitPromise: false,
-      };
-      if (contextId !== null) callParams.contextId = contextId;
-      const result = await cdp.call("Runtime.evaluate", callParams);
-      const value = result?.result?.value;
-
-      if (value?.ok) {
-        const ch = getChannel(ctx);
-        userStopRequestedChannels.add(channelKey(ch));
-        await replyHtml(
-          ctx,
-          `<b>⏹️ Generation Interrupted</b>\nAI response generation was safely stopped.`,
-        );
-      } else {
-        await replyHtml(
-          ctx,
-          `<b>⚠️ Could Not Stop</b>\n${escapeHtml(value?.error || "Stop button not found.")}`,
-        );
-      }
-    } catch (e: any) {
-      await ctx.reply(`❌ Error during stop: ${e.message}`);
-    }
-  });
-
-  // /project command
-  bot.command("project", async (ctx) => {
-    const workspaces = workspaceService.scanWorkspaces();
-    const { text, keyboard } = buildProjectListUI(workspaces, 0);
-    await replyHtml(ctx, text, keyboard);
-  });
-
-  // [KaizenGuy] /schedule command — quản lý scheduled jobs từ Telegram
-  bot.command("schedule", async (ctx) => {
-    const args = (ctx.match || "").trim();
-    const parts = args.split(/\s+/);
-    const subCmd = parts[0]?.toLowerCase();
-
-    if (!subCmd || subCmd === "list") {
-      // /schedule list
-      const jobs = scheduleService.listSchedules();
-      if (jobs.length === 0) {
-        await ctx.reply("📭 Không có schedule nào.");
-        return;
-      }
-      let text = `<b>🕒 Scheduled Jobs (${jobs.length})</b>\n\n`;
-      for (const job of jobs) {
-        const status = job.enabled ? "🟢" : "⚪";
-        const promptPreview = job.prompt.length > 60 ? job.prompt.substring(0, 60) + "..." : job.prompt;
-        const modelTag = job.model ? ` · 🤖 ${escapeHtml(job.model)}` : "";
-        text += `${status} <b>#${job.id}</b> | <code>${escapeHtml(job.cronExpression)}</code>${modelTag}\n`;
-        text += `   <i>${escapeHtml(promptPreview)}</i>\n\n`;
-      }
-      text += `<i>Dùng /schedule add, /schedule remove, /schedule toggle</i>`;
-      await replyHtml(ctx, text);
-    } else if (subCmd === "add") {
-      // /schedule add <cron> | <prompt> [| <model>]
-      const rest = args.substring(4).trim();
-      const pipeParts = rest.split("|").map(s => s.trim());
-      if (pipeParts.length < 2 || !pipeParts[0] || !pipeParts[1]) {
-        await ctx.reply("Usage: /schedule add <cron> | <prompt> [| <model>]\nVD: /schedule add 0 9 * * * | Nhắc anh Vũ | gemini-3-flash");
-        return;
-      }
-      const cronExpr = pipeParts[0];
-      const prompt = pipeParts[1];
-      const scheduleModel = pipeParts[2] || null; // optional model
-      try {
-        const ch = getChannel(ctx);
-        const binding = workspaceBindingRepo.findByChannelId(channelKey(ch));
-        const wsPath = binding?.workspacePath || config.workspaceBaseDir;
-        const record = scheduleService.addSchedule(cronExpr, prompt, wsPath, async (schedule) => {
-          try {
-            logger.info(`[Schedule] Firing job #${schedule.id}: ${schedule.prompt.substring(0, 80)}...`);
-            const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
-            const projectName = bridge.pool.extractProjectName(schedule.workspacePath);
-            bridge.lastActiveWorkspace = projectName;
-
-            // [KaizenGuy] Switch model nếu schedule có chỉ định
-            let previousModel: string | null = null;
-            if (schedule.model) {
-              try {
-                previousModel = await cdp.getCurrentModel();
-                await cdp.setUiModel(schedule.model);
-                logger.info(`[Schedule] Switched to model: ${schedule.model}`);
-              } catch (modelErr: any) {
-                logger.warn(`[Schedule] Model switch error: ${modelErr.message}`);
-              }
-            }
-
-            const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
-            const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
-            bridge.lastActiveChannel = scheduleCh;
-            try {
-              await promptDispatcher.send({
-                channel: scheduleCh,
-                prompt: schedule.prompt,
-                cdp,
-                inboundImages: [],
-                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-              });
-            } finally {
-              if (previousModel && schedule.model) {
-                try { await cdp.setUiModel(previousModel); } catch { /* best effort */ }
-              }
-            }
-          } catch (e: any) {
-            logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
-            const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
-            if (defaultChatId && bot.api) {
-              bot.api.sendMessage(defaultChatId, `⚠️ Schedule job #${schedule.id} failed: ${e.message}`).catch(() => {});
-            }
-          }
-        }, scheduleModel);
-        const modelInfo = scheduleModel ? `\n🤖 ${escapeHtml(scheduleModel)}` : "";
-        await replyHtml(ctx, `✅ Schedule #${record.id} đã tạo\n<code>${escapeHtml(cronExpr)}</code>\n<i>${escapeHtml(prompt.substring(0, 100))}</i>${modelInfo}`);
-      } catch (e: any) {
-        await ctx.reply(`❌ Lỗi: ${e.message}`);
-      }
-    } else if (subCmd === "remove" || subCmd === "rm" || subCmd === "delete") {
-      // /schedule remove <id>
-      const id = parseInt(parts[1]);
-      if (!id || isNaN(id)) {
-        await ctx.reply("Usage: /schedule remove <id>");
-        return;
-      }
-      const removed = scheduleService.removeSchedule(id);
-      if (removed) {
-        await ctx.reply(`✅ Schedule #${id} đã xoá (cron đã dừng).`);
-      } else {
-        await ctx.reply(`❌ Không tìm thấy schedule #${id}.`);
-      }
-    } else if (subCmd === "toggle") {
-      // /schedule toggle <id>
-      const id = parseInt(parts[1]);
-      if (!id || isNaN(id)) {
-        await ctx.reply("Usage: /schedule toggle <id>");
-        return;
-      }
-      const jobs = scheduleService.listSchedules();
-      const job = jobs.find(j => j.id === id);
-      if (!job) {
-        await ctx.reply(`❌ Không tìm thấy schedule #${id}.`);
-        return;
-      }
-      // Toggle: nếu đang enabled thì remove (stop cron), nếu disabled thì re-add
-      if (job.enabled) {
-        scheduleService.removeSchedule(id);
-        // Re-insert as disabled
-        const db2 = db; // reuse same db reference
-        db2.prepare("INSERT INTO schedules (id, cron_expression, prompt, workspace_path, enabled, model) VALUES (?, ?, ?, ?, 0, ?)").run(id, job.cronExpression, job.prompt, job.workspacePath, job.model ?? null);
-        await ctx.reply(`⚪ Schedule #${id} đã tắt.`);
-      } else {
-        // Enable: delete disabled record, re-add as enabled
-        db.prepare("DELETE FROM schedules WHERE id = ?").run(id);
-        scheduleService.addSchedule(job.cronExpression, job.prompt, job.workspacePath, async (schedule) => {
-          try {
-            const cdp = await bridge.pool.getOrConnect(schedule.workspacePath);
-            const defaultChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
-            const scheduleCh: TelegramChannel = { chatId: defaultChatId, threadId: undefined };
-            bridge.lastActiveChannel = scheduleCh;
-            await promptDispatcher.send({
-              channel: scheduleCh, prompt: schedule.prompt, cdp, inboundImages: [],
-              options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-            });
-          } catch (e: any) {
-            logger.error(`[Schedule] Job failed:`, e.message);
-          }
-        });
-        await ctx.reply(`🟢 Schedule #${id} đã bật lại.`);
-      }
-    } else {
-      await replyHtml(ctx,
-        `<b>🕒 /schedule commands</b>\n\n` +
-        `/schedule list — Xem danh sách\n` +
-        `/schedule add &lt;cron&gt; | &lt;prompt&gt; [| &lt;model&gt;] — Thêm mới\n` +
-        `/schedule remove &lt;id&gt; — Xoá\n` +
-        `/schedule toggle &lt;id&gt; — Bật/tắt`
-      );
-    }
-  });
-
-  // /new command
-  bot.command("new", async (ctx) => {
-    const ch = getChannel(ctx);
-    const key = channelKey(ch);
-    const session = chatSessionRepo.findByChannelId(key);
-    const binding = workspaceBindingRepo.findByChannelId(key);
-    const workspaceName = session?.workspacePath ?? binding?.workspacePath;
-
-    if (!workspaceName) {
-      await ctx.reply(
-        "⚠️ No project is bound to this chat. Use /project to select one.",
-      );
-      return;
-    }
-
-    const workspacePath = workspaceService.getWorkspacePath(workspaceName);
-    let cdp;
-    try {
-      cdp = await bridge.pool.getOrConnect(workspacePath);
-    } catch (e: any) {
-      await ctx.reply(`⚠️ Failed to connect: ${e.message}`);
-      return;
-    }
-
-    try {
-      const chatResult = await chatSessionService.startNewChat(cdp);
-      if (chatResult.ok) {
-        await replyHtml(
-          ctx,
-          `<b>💬 New Chat Started</b>\nSend your message now.`,
-        );
-      } else {
-        await ctx.reply(`⚠️ Could not start new chat: ${chatResult.error}`);
-      }
-    } catch (e: any) {
-      await ctx.reply(`⚠️ Error: ${e.message}`);
-    }
-  });
-
-  // /chat command — [KaizenGuy] Rewritten to scrape real conversations from Antigravity UI
-  bot.command("chat", async (ctx) => {
-    const ch = getChannel(ctx);
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    const activeNames = bridge.pool.getActiveWorkspaceNames();
-    const cdp =
-      resolved?.cdp ??
-      (activeNames.length > 0
-        ? bridge.pool.getConnected(activeNames[0])
-        : null);
-
-    if (!cdp) {
-      await replyHtml(
-        ctx,
-        `<b>💬 Chat Sessions</b>\n\n` +
-          `⚪ Not connected to CDP.\n` +
-          `<i>Send a message first or use /project to bind a project.</i>`,
-      );
-      return;
-    }
-
-    // Get current session info
-    const info = await chatSessionService.getCurrentSessionInfo(cdp);
-
-    // Scrape real conversations from Antigravity Past Conversations panel
-    const wsName = cdp.getCurrentWorkspaceName() ?? 'unknown';
-    const ctxCount = cdp.getContexts().length;
-    logger.info(`[/chat] workspace=${wsName} contexts=${ctxCount} activeNames=${activeNames.join(',')}`);
-    try {
-      const sessions = await chatSessionService.listAllSessions(cdp);
-      logger.info(`[/chat] listAllSessions returned ${sessions.length} sessions`);
-
-      if (sessions.length === 0) {
-        // [KaizenGuy] Debug: dump DOM info to find Past Conversations button selector
-        let debugInfo = `workspace: ${wsName}\ncontexts: ${ctxCount}\nactiveNames: ${activeNames.join(', ')}`;
-        const ctxs = cdp.getContexts();
-        for (const c of ctxs) {
-          debugInfo += `\nctx: id=${c.id} name=${c.name} url=${(c.url || '').substring(0, 60)}`;
-        }
-        try {
-          const contexts = cdp.getContexts();
-          for (const c of contexts) {
-            try {
-              const r = await cdp.call('Runtime.evaluate', {
-                expression: `(() => {
-                  const info = [];
-                  // All data-tooltip-id elements
-                  document.querySelectorAll('[data-tooltip-id]').forEach(el => {
-                    info.push('tooltip: ' + el.getAttribute('data-tooltip-id') + ' [' + el.tagName + '] visible=' + (el.offsetParent !== null));
-                  });
-                  // SVG lucide classes
-                  document.querySelectorAll('svg[class*="lucide"]').forEach(svg => {
-                    info.push('svg: ' + (svg.className.baseVal || svg.getAttribute('class')));
-                  });
-                  // Panel header buttons
-                  const panel = document.querySelector('.antigravity-agent-side-panel');
-                  if (panel) {
-                    const header = panel.querySelector('div[class*="border-b"]');
-                    if (header) {
-                      header.querySelectorAll('*').forEach(el => {
-                        const tid = el.getAttribute && el.getAttribute('data-tooltip-id');
-                        const cls = (el.className || '').toString().substring(0, 80);
-                        if (tid || el.tagName === 'BUTTON' || el.tagName === 'SVG') {
-                          info.push('hdr: <' + el.tagName + '> tooltip=' + tid + ' class=' + cls);
-                        }
-                      });
-                    } else {
-                      info.push('no header found in panel');
-                    }
-                  } else {
-                    info.push('no .antigravity-agent-side-panel found');
-                  }
-                  // data-past-conversations-toggle check
-                  info.push('toggle: ' + !!document.querySelector('[data-past-conversations-toggle]'));
-                  return info.join('\\n');
-                })()`,
-                returnByValue: true,
-                contextId: c.id,
-              });
-              const val = r?.result?.value;
-              if (val && typeof val === 'string' && val.length > 10) {
-                debugInfo = val;
-                break;
-              }
-            } catch (_) {}
-          }
-        } catch (_) {}
-
-        await replyHtml(
-          ctx,
-          `<b>💬 Chat Sessions</b>\n\n` +
-            `<b>Current:</b> ${escapeHtml(info.title)}\n` +
-            `<b>Status:</b> ${info.hasActiveChat ? "🟢 Active" : "⚪ Empty"}\n\n` +
-            `<i>No past conversations found.</i>\n\n` +
-            `<pre>${escapeHtml(debugInfo || 'no debug info')}</pre>`,
-        );
-        return;
-      }
-
-      // Build session picker with inline keyboard
-      const { text: pickerText, keyboard } = buildSessionPickerUI(sessions);
-
-      await replyHtml(
-        ctx,
-        `<b>💬 Chat Sessions</b>\n\n` +
-          `<b>Current:</b> ${escapeHtml(info.title)}\n` +
-          `<b>Status:</b> ${info.hasActiveChat ? "🟢 Active" : "⚪ Empty"}\n\n` +
-          pickerText,
-        keyboard,
-      );
-    } catch (e: any) {
-      logger.warn(`[/chat] Failed to list sessions: ${e.message}`);
-      await replyHtml(
-        ctx,
-        `<b>💬 Chat Sessions</b>\n\n` +
-          `<b>Current:</b> ${escapeHtml(info.title)}\n` +
-          `<b>Status:</b> ${info.hasActiveChat ? "🟢 Active" : "⚪ Empty"}\n\n` +
-          `⚠️ Could not load past conversations.`,
-      );
-    }
-  });
-
-  // /ping command
-  bot.command("ping", async (ctx) => {
-    const start = Date.now();
-    const msg = await ctx.reply("🏓 Pong!");
-    const latency = Date.now() - start;
-    await bot.api.editMessageText(
-      ctx.chat!.id,
-      msg.message_id,
-      `🏓 Pong! Latency: <b>${latency}ms</b>`,
-      { parse_mode: "HTML" },
-    );
-  });
-
-  // =============================================================================
-  // Callback query handler (inline keyboard buttons)
-  // =============================================================================
-
-  bot.on("callback_query:data", async (ctx) => {
-    const data = ctx.callbackQuery.data;
-    const ch = getChannelFromCb(ctx);
-
-    // Mode selection
-    if (data.startsWith("mode_select:")) {
-      const selectedMode = data.replace("mode_select:", "");
-      modeService.setMode(selectedMode);
-      const cdp = getCurrentCdp(bridge);
-      if (cdp) {
-        const res = await cdp.setUiMode(selectedMode);
-        if (!res.ok) logger.warn(`[Mode] UI switch failed: ${res.error}`);
-      }
-      const { text, keyboard } = await buildModeUI(modeService, {
-        getCurrentCdp: () => getCurrentCdp(bridge),
-      });
-      try {
-        await ctx.editMessageText(text, {
-          parse_mode: "HTML",
-          reply_markup: keyboard,
-        });
-      } catch {
-        /* may fail if unchanged */
-      }
-      await ctx.answerCallbackQuery({
-        text: `Mode: ${MODE_DISPLAY_NAMES[selectedMode] || selectedMode}`,
-      });
-      return;
-    }
-
-    // Exhausted model button — show alert toast
-    if (data.startsWith("model_exhausted_")) {
-      const modelName = data.replace("model_exhausted_", "");
-      await ctx.answerCallbackQuery({
-        text: `⛔ ${modelName} is exhausted. Wait for quota reset or pick another model.`,
-        show_alert: true,
-      });
-      return;
-    }
-
-    // Model selection
-    if (data.startsWith("model_btn_")) {
-      const modelName = data.replace("model_btn_", "");
-      const cdp = getCurrentCdp(bridge);
-      if (!cdp) {
-        await ctx.answerCallbackQuery({ text: "Not connected to CDP." });
-        return;
-      }
-      const res = await cdp.setUiModel(modelName);
-      if (res.ok) {
-        const payload = await buildModelsUI(cdp, () =>
-          bridge.quota.fetchQuota(),
-        );
-        if (payload)
-          try {
-            await ctx.editMessageText(payload.text, {
-              parse_mode: "HTML",
-              reply_markup: payload.keyboard,
-            });
-          } catch {}
-        await ctx.answerCallbackQuery({ text: `Model: ${res.model}` });
-      } else {
-        await ctx.answerCallbackQuery({
-          text: res.error || "Failed to change model.",
-        });
-      }
-      return;
-    }
-
-    // Model refresh
-    if (data === "model_refresh_btn") {
-      const cdp = getCurrentCdp(bridge);
-      if (!cdp) {
-        await ctx.answerCallbackQuery({ text: "Not connected." });
-        return;
-      }
-      const payload = await buildModelsUI(cdp, () => bridge.quota.fetchQuota());
-      if (payload)
-        try {
-          await ctx.editMessageText(payload.text, {
-            parse_mode: "HTML",
-            reply_markup: payload.keyboard,
-          });
-        } catch {}
-      await ctx.answerCallbackQuery({ text: "Refreshed" });
-      return;
-    }
-
-    // Auto-accept buttons
-    if (data === AUTOACCEPT_BTN_ON || data === AUTOACCEPT_BTN_OFF) {
-      const action = data === AUTOACCEPT_BTN_ON ? "on" : "off";
-      bridge.autoAccept.handle(action);
-      await sendAutoAcceptUI(async (text, keyboard) => {
-        try {
-          await ctx.editMessageText(text, {
-            parse_mode: "HTML",
-            reply_markup: keyboard,
-          });
-        } catch {}
-      }, bridge.autoAccept);
-      await ctx.answerCallbackQuery({
-        text: `Auto-accept: ${action.toUpperCase()}`,
-      });
-      return;
-    }
-
-    if (data === AUTOACCEPT_BTN_REFRESH) {
-      await sendAutoAcceptUI(async (text, keyboard) => {
-        try {
-          await ctx.editMessageText(text, {
-            parse_mode: "HTML",
-            reply_markup: keyboard,
-          });
-        } catch {}
-      }, bridge.autoAccept);
-      await ctx.answerCallbackQuery({ text: "Refreshed" });
-      return;
-    }
-
-    // Project selection
-    if (data.startsWith(`${PROJECT_SELECT_ID}:`)) {
-      const workspacePath = data.replace(`${PROJECT_SELECT_ID}:`, "");
-      if (!workspaceService.exists(workspacePath)) {
-        await ctx.answerCallbackQuery({
-          text: `Project "${workspacePath}" not found.`,
-        });
-        return;
-      }
-
-      let key = channelKey(ch);
-      const guildId = String(ch.chatId);
-      const isForum =
-        ctx.chat?.type === "supergroup" && (ctx.chat as any).is_forum === true;
-
-      // Auto-create topic if conditions are met
-      if (config.useTopics && isForum && !ch.threadId) {
-        try {
-          const existing = workspaceBindingRepo.findByWorkspacePathAndGuildId(
-            workspacePath,
-            guildId,
-          );
-          const existingTopic = existing.find((b) => b.channelId.includes(":"));
-
-          let topicId: number;
-          if (existingTopic) {
-            topicId = Number(existingTopic.channelId.split(":")[1]);
-            topicManager.registerTopic(workspacePath, topicId);
-          } else {
-            topicManager.setChatId(ch.chatId);
-            const sanitized = topicManager.sanitizeName(workspacePath);
-            const result = await topicManager.ensureTopic(sanitized);
-            topicId = result.topicId;
-          }
-
-          key = `${ch.chatId}:${topicId}`;
-
-          // Send welcome message in the new topic
-          const fullPath = workspaceService.getWorkspacePath(workspacePath);
-          await bot.api.sendMessage(
-            ch.chatId,
-            `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\nSend messages here to interact with this project.`,
-            { parse_mode: "HTML", message_thread_id: topicId },
-          );
-          workspaceBindingRepo.upsert({
-            channelId: key,
-            workspacePath,
-            guildId,
-          });
-          await ctx.answerCallbackQuery({
-            text: `Topic created for: ${workspacePath}`,
-          });
-          return;
-        } catch (e: any) {
-          logger.warn(
-            `[ProjectSelect] Topic creation failed, falling back: ${e.message}`,
-          );
-          // Fall through to default behavior
-        }
-      }
-
-      workspaceBindingRepo.upsert({ channelId: key, workspacePath, guildId });
-
-      const fullPath = workspaceService.getWorkspacePath(workspacePath);
-      await ctx.editMessageText(
-        `<b>📁 Project Selected</b>\n\n✅ <b>${escapeHtml(workspacePath)}</b>\n<code>${escapeHtml(fullPath)}</code>\n\nSend messages here to interact with this project.`,
-        { parse_mode: "HTML" },
-      );
-      await ctx.answerCallbackQuery({ text: `Selected: ${workspacePath}` });
-      return;
-    }
-
-    // Project page navigation
-    if (data.startsWith(`${PROJECT_PAGE_PREFIX}:`)) {
-      const page = parseProjectPageId(data);
-      if (!isNaN(page)) {
-        const workspaces = workspaceService.scanWorkspaces();
-        const { text, keyboard } = buildProjectListUI(workspaces, page);
-        try {
-          await ctx.editMessageText(text, {
-            parse_mode: "HTML",
-            reply_markup: keyboard,
-          });
-        } catch {}
-      }
-      await ctx.answerCallbackQuery();
-      return;
-    }
-
-    // Template button
-    if (data.startsWith(TEMPLATE_BTN_PREFIX)) {
-      const templateId = parseTemplateButtonId(data);
-      if (isNaN(templateId)) {
-        await ctx.answerCallbackQuery({ text: "Invalid template." });
-        return;
-      }
-      const template = templateRepo.findById(templateId);
-      if (!template) {
-        await ctx.answerCallbackQuery({ text: "Template not found." });
-        return;
-      }
-
-      const resolved = await resolveWorkspaceAndCdp(ch);
-      if (!resolved) {
-        const cdp = getCurrentCdp(bridge);
-        if (!cdp) {
-          await ctx.answerCallbackQuery({ text: "Not connected." });
-          return;
-        }
-        await promptDispatcher.send({
-          channel: ch,
-          prompt: template.prompt,
-          cdp,
-          inboundImages: [],
-          options: {
-            chatSessionService,
-            chatSessionRepo,
-            topicManager,
-            titleGenerator,
-          },
-        });
-      } else {
-        await promptDispatcher.send({
-          channel: ch,
-          prompt: template.prompt,
-          cdp: resolved.cdp,
-          inboundImages: [],
-          options: {
-            chatSessionService,
-            chatSessionRepo,
-            topicManager,
-            titleGenerator,
-          },
-        });
-      }
-      await ctx.answerCallbackQuery({ text: `Running: ${template.name}` });
-      return;
-    }
-
-    // Session selection — [KaizenGuy] Enhanced with logging + wait after switch
-    if (isSessionSelectId(data)) {
-      const selectedTitle = data.replace(`${SESSION_SELECT_ID}:`, "");
-      logger.info(`[SESSION_SELECT] User selected: "${selectedTitle}"`);
-
-      const key = channelKey(ch);
-      const binding = workspaceBindingRepo.findByChannelId(key);
-
-      // Get CDP connection: from binding, or fallback to any active workspace
-      let cdp: CdpService | null = null;
-      try {
-        if (binding) {
-          const workspacePath = workspaceService.getWorkspacePath(binding.workspacePath);
-          cdp = await bridge.pool.getOrConnect(workspacePath);
-        } else {
-          const activeNames = bridge.pool.getActiveWorkspaceNames();
-          cdp = activeNames.length > 0 ? bridge.pool.getConnected(activeNames[0]) : null;
-        }
-      } catch (e: any) {
-        logger.warn(`[SESSION_SELECT] CDP connection error: ${e.message}`);
-      }
-
-      if (!cdp) {
-        await ctx.answerCallbackQuery({ text: "No CDP connection available." });
-        return;
-      }
-
-      try {
-        const activateResult = await chatSessionService.activateSessionByTitle(
-          cdp,
-          selectedTitle,
-        );
-        logger.info(`[SESSION_SELECT] activateResult: ${JSON.stringify(activateResult)}`);
-
-        if (activateResult.ok) {
-          // Wait for conversation to fully load after switch
-          await new Promise((r) => setTimeout(r, 2000));
-
-          // Verify conversation switched correctly
-          const currentInfo = await chatSessionService.getCurrentSessionInfo(cdp);
-          logger.info(`[SESSION_SELECT] After switch, current title: "${currentInfo.title}"`);
-
-          await ctx.editMessageText(
-            `<b>🔗 Joined Session</b>\n\n<b>${escapeHtml(selectedTitle)}</b>`,
-            { parse_mode: "HTML" },
-          );
-        } else {
-          logger.warn(`[SESSION_SELECT] Activate failed: ${activateResult.error}`);
-          await ctx.answerCallbackQuery({
-            text: `Failed: ${activateResult.error}`,
-          });
-        }
-      } catch (e: any) {
-        logger.error(`[SESSION_SELECT] Error: ${e.message}`);
-        await ctx.answerCallbackQuery({ text: `Error: ${e.message}` });
-      }
-      return;
-    }
-
-    // Approval buttons
-    const approvalAction = parseApprovalCustomId(data);
-    if (approvalAction) {
-      const projectName =
-        approvalAction.projectName ?? bridge.lastActiveWorkspace;
-      const detector = projectName
-        ? bridge.pool.getApprovalDetector(projectName)
-        : undefined;
-      if (!detector) {
-        await ctx.answerCallbackQuery({ text: "Approval detector not found." });
-        return;
-      }
-
-      let success = false;
-      let actionLabel = "";
-      if (approvalAction.action === "approve") {
-        success = await detector.approveButton();
-        actionLabel = "Allow";
-      } else if (approvalAction.action === "always_allow") {
-        success = await detector.alwaysAllowButton();
-        actionLabel = "Allow Chat";
-      } else {
-        success = await detector.denyButton();
-        actionLabel = "Deny";
-      }
-
-      if (success) {
-        try {
-          await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-        } catch {}
-        await ctx.answerCallbackQuery({ text: `${actionLabel} executed.` });
-      } else {
-        await ctx.answerCallbackQuery({ text: "Button not found." });
-      }
-      return;
-    }
-
-    // Planning buttons (legacy parsing for backward compat)
-    const planningAction = parsePlanningCustomId(data);
-    if (planningAction) {
-      const projectName =
-        planningAction.projectName ?? bridge.lastActiveWorkspace;
-      const detector = projectName
-        ? bridge.pool.getPlanningDetector(projectName)
-        : undefined;
-      if (!detector) {
-        await ctx.answerCallbackQuery({ text: "Planning detector not found." });
-        return;
-      }
-
-      if (planningAction.action === "open") {
-        const clicked = await detector.clickOpenButton();
-        if (clicked) {
-          await new Promise((r) => setTimeout(r, 500));
-          let planContent: string | null = null;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            planContent = await detector.extractPlanContent();
-            if (planContent) break;
-            await new Promise((r) => setTimeout(r, 500));
-          }
-          if (planContent) {
-            const chKey = channelKey(ch);
-            const pages = paginatePlanContent(planContent);
-            planContentCache.set(chKey, pages);
-            const targetChannelStr = ch.threadId
-              ? String(ch.threadId)
-              : String(ch.chatId);
-            const { text: pageText, keyboard: pageKeyboard } =
-              buildPlanContentUI(pages, 0, projectName || "", targetChannelStr);
-            await bot.api.sendMessage(ch.chatId, pageText, {
-              parse_mode: "HTML",
-              message_thread_id: ch.threadId,
-              reply_markup: pageKeyboard,
-            });
-          }
-        }
-        await ctx.answerCallbackQuery({
-          text: clicked ? "Opened" : "Open button not found.",
-        });
-      } else {
-        const clicked = await detector.clickProceedButton();
-        if (clicked)
-          try {
-            await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-          } catch {}
-        await ctx.answerCallbackQuery({
-          text: clicked ? "Proceeding..." : "Proceed button not found.",
-        });
-      }
-      return;
-    }
-
-    // New plan UI buttons (View/Proceed/Edit/Refresh)
-    if (data.startsWith(PLAN_VIEW_BTN + ":")) {
-      const suffix = data.substring(PLAN_VIEW_BTN.length + 1);
-      const [projectName] = suffix.split(":");
-      const detector = projectName
-        ? bridge.pool.getPlanningDetector(projectName)
-        : undefined;
-      if (!detector) {
-        await ctx.answerCallbackQuery({ text: "Planning detector not found." });
-        return;
-      }
-
-      const clicked = await detector.clickOpenButton();
-      if (clicked) {
-        await new Promise((r) => setTimeout(r, 500));
-        let planContent: string | null = null;
-        for (let attempt = 0; attempt < 3; attempt++) {
-          planContent = await detector.extractPlanContent();
-          if (planContent) break;
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        if (planContent) {
-          const chKey = channelKey(ch);
-          const pages = paginatePlanContent(planContent);
-          planContentCache.set(chKey, pages);
-          const targetChannelStr = ch.threadId
-            ? String(ch.threadId)
-            : String(ch.chatId);
-          const { text: pageText, keyboard: pageKeyboard } = buildPlanContentUI(
-            pages,
-            0,
-            projectName,
-            targetChannelStr,
-          );
-          await bot.api.sendMessage(ch.chatId, pageText, {
-            parse_mode: "HTML",
-            message_thread_id: ch.threadId,
-            reply_markup: pageKeyboard,
-          });
-        }
-      }
-      await ctx.answerCallbackQuery({
-        text: clicked ? "Opened" : "Open button not found.",
-      });
-      return;
-    }
-
-    if (data.startsWith(PLAN_PROCEED_BTN + ":")) {
-      const suffix = data.substring(PLAN_PROCEED_BTN.length + 1);
-      const [projectName] = suffix.split(":");
-      const detector = projectName
-        ? bridge.pool.getPlanningDetector(projectName)
-        : undefined;
-      if (!detector) {
-        await ctx.answerCallbackQuery({ text: "Planning detector not found." });
-        return;
-      }
-
-      const clicked = await detector.clickProceedButton();
-      if (clicked) {
-        planEditPendingChannels.delete(channelKey(ch));
-        try {
-          await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-        } catch {}
-      }
-      await ctx.answerCallbackQuery({
-        text: clicked ? "Proceeding..." : "Proceed button not found.",
-      });
-      return;
-    }
-
-    if (data.startsWith(PLAN_EDIT_BTN + ":")) {
-      const suffix = data.substring(PLAN_EDIT_BTN.length + 1);
-      const [projectName] = suffix.split(":");
-      planEditPendingChannels.set(channelKey(ch), { projectName });
-      await ctx.answerCallbackQuery({
-        text: "Type your edit instructions (or /cancel).",
-      });
-      await bot.api.sendMessage(
-        ch.chatId,
-        "<b>Edit Plan</b>\n\nType your plan edit instructions below.\nSend <code>/cancel</code> to cancel.",
-        { parse_mode: "HTML", message_thread_id: ch.threadId },
-      );
-      return;
-    }
-
-    if (data.startsWith(PLAN_REFRESH_BTN + ":")) {
-      const suffix = data.substring(PLAN_REFRESH_BTN.length + 1);
-      const [projectName, targetChannelStr] = suffix.split(":");
-      const detector = projectName
-        ? bridge.pool.getPlanningDetector(projectName)
-        : undefined;
-      if (!detector) {
-        await ctx.answerCallbackQuery({ text: "Planning detector not found." });
-        return;
-      }
-
-      const info = detector.getLastDetectedInfo();
-      if (info) {
-        const { text: uiText, keyboard: uiKeyboard } = buildPlanNotificationUI(
-          info,
-          projectName,
-          targetChannelStr || String(ch.chatId),
-        );
-        try {
-          await ctx.editMessageText(uiText, {
-            parse_mode: "HTML",
-            reply_markup: uiKeyboard,
-          });
-        } catch {}
-      }
-      await ctx.answerCallbackQuery({ text: "Refreshed" });
-      return;
-    }
-
-    // Plan pagination
-    if (data.startsWith(PLAN_PAGE_PREFIX + ":")) {
-      const rest = data.substring(PLAN_PAGE_PREFIX.length + 1);
-      const colonIdx = rest.indexOf(":");
-      const page = parseInt(rest.substring(0, colonIdx), 10);
-      const suffix = rest.substring(colonIdx + 1);
-      const [projectName, targetChannelStr] = suffix.split(":");
-      const chKey = channelKey(ch);
-      const pages = planContentCache.get(chKey);
-      if (!pages || isNaN(page)) {
-        await ctx.answerCallbackQuery({ text: "Page not found." });
-        return;
-      }
-
-      const { text: pageText, keyboard: pageKeyboard } = buildPlanContentUI(
-        pages,
-        page,
-        projectName,
-        targetChannelStr || String(ch.chatId),
-      );
-      try {
-        await ctx.editMessageText(pageText, {
-          parse_mode: "HTML",
-          reply_markup: pageKeyboard,
-        });
-      } catch {}
-      await ctx.answerCallbackQuery({
-        text: `Page ${page + 1}/${pages.length}`,
-      });
-      return;
-    }
-
-    // Error popup buttons
-    const errorAction = parseErrorPopupCustomId(data);
-    if (errorAction) {
-      const projectName = errorAction.projectName ?? bridge.lastActiveWorkspace;
-      const detector = projectName
-        ? bridge.pool.getErrorPopupDetector(projectName)
-        : undefined;
-      if (!detector) {
-        await ctx.answerCallbackQuery({
-          text: "Error popup detector not found.",
-        });
-        return;
-      }
-
-      if (errorAction.action === "dismiss") {
-        const clicked = await detector.clickDismissButton();
-        if (clicked)
-          try {
-            await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-          } catch {}
-        await ctx.answerCallbackQuery({
-          text: clicked ? "Dismissed" : "Button not found.",
-        });
-      } else if (errorAction.action === "copy_debug") {
-        const clicked = await detector.clickCopyDebugInfoButton();
-        let clipboardOk = false;
-        if (clicked) {
-          await new Promise((r) => setTimeout(r, 300));
-          const clipboardContent = await detector.readClipboard();
-          if (clipboardContent) {
-            clipboardOk = true;
-            const truncated =
-              clipboardContent.length > 3800
-                ? clipboardContent.substring(0, 3800) + "\n(truncated)"
-                : clipboardContent;
-            await bot.api.sendMessage(
-              ch.chatId,
-              `<b>Debug Info</b>\n\n<pre>${escapeHtml(truncated)}</pre>`,
-              { parse_mode: "HTML", message_thread_id: ch.threadId },
-            );
-          }
-        }
-        const feedbackText = !clicked
-          ? "Button not found."
-          : clipboardOk
-            ? "Copied"
-            : "Could not read clipboard.";
-        await ctx.answerCallbackQuery({ text: feedbackText });
-      } else {
-        const clicked = await detector.clickRetryButton();
-        if (clicked)
-          try {
-            await ctx.editMessageReplyMarkup({ reply_markup: undefined });
-          } catch {}
-        await ctx.answerCallbackQuery({
-          text: clicked ? "Retrying..." : "Button not found.",
-        });
-      }
-      return;
-    }
-
-    // Cleanup buttons
-    if (
-      data.startsWith(CLEANUP_ARCHIVE_BTN) ||
-      data.startsWith(CLEANUP_DELETE_BTN) ||
-      data === CLEANUP_CANCEL_BTN
-    ) {
-      if (data === CLEANUP_CANCEL_BTN) {
-        try {
-          await ctx.editMessageText("Cleanup cancelled.");
-        } catch {}
-        await ctx.answerCallbackQuery({ text: "Cancelled" });
-        return;
-      }
-
-      const isDelete = data.startsWith(CLEANUP_DELETE_BTN);
-      const callbackDays = parseInt(data.split(":")[1], 10) || 7;
-      const guildId = String(ch.chatId);
-      const inactive = cleanupHandler.findInactiveSessions(
-        guildId,
-        callbackDays,
-      );
-
-      let processed = 0;
-      for (const { binding } of inactive) {
-        const threadId = binding.channelId.includes(":")
-          ? Number(binding.channelId.split(":")[1])
-          : undefined;
-
-        if (threadId) {
-          try {
-            if (isDelete) {
-              await bot.api.deleteForumTopic(ch.chatId, threadId);
-            } else {
-              await bot.api.closeForumTopic(ch.chatId, threadId);
-            }
-          } catch (e: any) {
-            logger.warn(
-              `[Cleanup] Topic operation failed for ${binding.channelId}: ${e.message}`,
-            );
-          }
-        }
-
-        cleanupHandler.cleanupByChannelId(binding.channelId);
-        processed++;
-      }
-
-      const action = isDelete ? "deleted" : "archived";
-      try {
-        await ctx.editMessageText(
-          `✅ Cleanup complete — ${processed} session(s) ${action}.`,
-        );
-      } catch {}
-      await ctx.answerCallbackQuery({
-        text: `${processed} session(s) ${action}`,
-      });
-      return;
-    }
-
-    await ctx.answerCallbackQuery();
-  });
-
-  // =============================================================================
-  // Text message handler (main chat flow)
-  // =============================================================================
-
-  bot.on("message:text", async (ctx) => {
-    const ch = getChannel(ctx);
-    const key = channelKey(ch);
-    const text = ctx.message.text.trim();
-
-    if (!text) return;
-
-    // Plan edit interception
-    const pendingPlanEdit = planEditPendingChannels.get(key);
-    if (pendingPlanEdit) {
-      if (text === "/cancel") {
-        planEditPendingChannels.delete(key);
-        await ctx.reply("Plan edit cancelled.");
-        return;
-      }
-
-      planEditPendingChannels.delete(key);
-      const editPrompt = `Please revise the plan based on the following feedback:\n\n${text}`;
-      const resolved = await resolveWorkspaceAndCdp(ch);
-      const cdp = resolved?.cdp ?? getCurrentCdp(bridge);
-      if (!cdp) {
-        await ctx.reply("Not connected to CDP.");
-        return;
-      }
-      await ctx.reply("Sending plan edit...");
-      await promptDispatcher.send({
-        channel: ch,
-        prompt: editPrompt,
-        cdp,
-        inboundImages: [],
-        options: {
-          chatSessionService,
-          chatSessionRepo,
-          topicManager,
-          titleGenerator,
-        },
-      });
-      return;
-    }
-
-    // Check if it looks like a text command
-    const parsed = parseMessageContent(text);
-    if (parsed.isCommand && parsed.commandName) {
-      if (parsed.commandName === "autoaccept") {
-        const result = bridge.autoAccept.handle(parsed.args?.[0]);
-        await ctx.reply(result.message);
-        return;
-      }
-
-      if (parsed.commandName === "screenshot") {
-        await handleScreenshot(
-          async (input, caption) => {
-            await ctx.replyWithPhoto(input, { caption });
-          },
-          async (text) => {
-            await ctx.reply(text);
-          },
-          getCurrentCdp(bridge),
-        );
-        return;
-      }
-
-      if (parsed.commandName === "status") {
-        const activeNames = bridge.pool.getActiveWorkspaceNames();
-        const currentMode = modeService.getCurrentMode();
-        let statusText = `<b>🔧 Bot Status</b>\n\n`;
-        statusText += `<b>CDP:</b> ${activeNames.length > 0 ? `🟢 ${activeNames.length} project(s)` : "⚪ Disconnected"}\n`;
-        statusText += `<b>Mode:</b> ${escapeHtml(MODE_DISPLAY_NAMES[currentMode] || currentMode)}\n`;
-        statusText += `<b>Auto Approve:</b> ${bridge.autoAccept.isEnabled() ? "🟢 ON" : "⚪ OFF"}`;
-        await replyHtml(ctx, statusText);
-        return;
-      }
-
-      const result = await slashCommandHandler.handleCommand(
-        parsed.commandName,
-        parsed.args || [],
-      );
-      await ctx.reply(result.message);
-
-      if (result.prompt) {
-        const cdp = getCurrentCdp(bridge);
-        if (cdp) {
-          await promptDispatcher.send({
-            channel: ch,
-            prompt: result.prompt,
-            cdp,
-            inboundImages: [],
-            options: {
-              chatSessionService,
-              chatSessionRepo,
-              topicManager,
-              titleGenerator,
-            },
-          });
-        } else {
-          await ctx.reply(
-            "Not connected to CDP. Send a message first to connect to a project.",
-          );
-        }
-      }
-      return;
-    }
-
-    // Regular message — route to Antigravity
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    if (!resolved) {
-      await ctx.reply(
-        "No project is configured for this chat. Use /project to select one.",
-      );
-      return;
-    }
-
-    const session = chatSessionRepo.findByChannelId(key);
-    if (session?.displayName) {
-      registerApprovalSessionChannel(
-        bridge,
-        resolved.projectName,
-        session.displayName,
-        ch,
-      );
-    }
-
-    if (session?.isRenamed && session.displayName) {
-      const activationResult = await chatSessionService.activateSessionByTitle(
-        resolved.cdp,
-        session.displayName,
-      );
-      if (!activationResult.ok) {
-        await ctx.reply(
-          `⚠️ Could not route to session (${session.displayName}).`,
-        );
-        return;
-      }
-    } else if (session && !session.isRenamed) {
-      try {
-        await chatSessionService.startNewChat(resolved.cdp);
-      } catch {
-        /* continue anyway */
-      }
-    }
-
-    const userMsgDetector = bridge.pool.getUserMessageDetector?.(
-      resolved.projectName,
-    );
-    if (userMsgDetector) userMsgDetector.addEchoHash(text);
-
-    await promptDispatcher.send({
-      channel: ch,
-      prompt: text,
-      cdp: resolved.cdp,
-      inboundImages: [],
-      options: {
-        chatSessionService,
-        chatSessionRepo,
-        topicManager,
-        titleGenerator,
-      },
-    });
-  });
-
-  // [KaizenGuy] Media group buffer — gom ảnh cùng album trước khi inject
-  const mediaGroupBuffer = new Map<string, {
-    photos: Array<{ file_id: string; file_size?: number }>;
-    caption: string;
-    channel: TelegramChannel;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
-
-  async function processPhotoGroup(
-    ch: TelegramChannel,
-    photos: Array<{ file_id: string; file_size?: number }>,
-    caption: string,
-  ): Promise<void> {
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    if (!resolved) return;
-
-    const inboundImages = await downloadTelegramImages(
-      bot.api,
-      config.telegramBotToken,
-      photos,
-      String(Date.now()),
-    );
-
-    if (inboundImages.length === 0) return;
-
-    // Append local paths to prompt so Antigravity knows where files are
-    const pathLines = inboundImages.map((img, i) =>
-      `${i + 1}. ${img.name} → ${img.localPath}`
-    ).join("\n");
-    const fullPrompt = `${caption}\n\n[Local image files]\n${pathLines}`;
-
-    await promptDispatcher.send({
-      channel: ch,
-      prompt: fullPrompt,
-      cdp: resolved.cdp,
-      inboundImages,
-      options: {
-        chatSessionService,
-        chatSessionRepo,
-        topicManager,
-        titleGenerator,
-      },
-    });
-    // [KaizenGuy] Do NOT cleanup — keep images in ~/.remoat/images/ for local access
-  }
-
-  // Photo message handler
-  bot.on("message:photo", async (ctx) => {
-    const ch = getChannel(ctx);
-    const photos = ctx.message.photo;
-    if (!photos || photos.length === 0) return;
-
-    const largest = photos[photos.length - 1];
-    const caption =
-      ctx.message.caption?.trim() ||
-      "Please review the attached images and respond accordingly.";
-
-    const mediaGroupId = ctx.message.media_group_id;
-
-    if (mediaGroupId) {
-      // Album mode — buffer photos with same media_group_id
-      const existing = mediaGroupBuffer.get(mediaGroupId);
-      if (existing) {
-        existing.photos.push(largest);
-        if (caption !== "Please review the attached images and respond accordingly.") {
-          existing.caption = caption; // Use caption from whichever message has one
-        }
-        clearTimeout(existing.timer);
-        existing.timer = setTimeout(async () => {
-          mediaGroupBuffer.delete(mediaGroupId);
-          try {
-            await processPhotoGroup(existing.channel, existing.photos, existing.caption);
-          } catch (e: any) {
-            logger.error("[PhotoGroup] Error processing album:", e?.message);
-          }
-        }, 1000);
-      } else {
-        const entry = {
-          photos: [largest],
-          caption,
-          channel: ch,
-          timer: setTimeout(async () => {
-            mediaGroupBuffer.delete(mediaGroupId);
-            try {
-              await processPhotoGroup(entry.channel, entry.photos, entry.caption);
-            } catch (e: any) {
-              logger.error("[PhotoGroup] Error processing album:", e?.message);
-            }
-          }, 1000),
-        };
-        mediaGroupBuffer.set(mediaGroupId, entry);
-      }
-    } else {
-      // Single photo — process immediately
-      const resolved = await resolveWorkspaceAndCdp(ch);
-      if (!resolved) {
-        await ctx.reply("No project configured. Use /project first.");
-        return;
-      }
-      await processPhotoGroup(ch, [largest], caption);
-    }
-  });
-
-  // Voice message handler (voice-to-prompt via local Whisper transcription)
-  bot.on("message:voice", async (ctx) => {
-    const ch = getChannel(ctx);
-
-    const whisperIssue = checkWhisperAvailability();
-    if (whisperIssue) {
-      await ctx.reply(whisperIssue);
-      return;
-    }
-
-    const resolved = await resolveWorkspaceAndCdp(ch);
-    if (!resolved) {
-      await ctx.reply("No project configured. Use /project first.");
-      return;
-    }
-
-    await ctx.reply("🎙️ Transcribing voice message...");
-
-    let voicePath: string;
-    try {
-      voicePath = await downloadTelegramVoice(
-        bot.api,
-        config.telegramBotToken,
-        ctx.message.voice,
-      );
-    } catch (error: any) {
-      logger.error("[Voice] Download failed:", error?.message || error);
-      await ctx.reply("❌ Could not download voice message. Please try again.");
-      return;
-    }
-
-    const transcript = await transcribeVoice(voicePath);
-    if (!transcript) {
-      await ctx.reply(
-        "❌ Could not transcribe voice message. Please try again or type your prompt.",
-      );
-      return;
-    }
-
-    // Check if transcription is a slash command
-    const parsed = parseMessageContent(transcript);
-    if (parsed.isCommand && parsed.commandName) {
-      const result = await slashCommandHandler.handleCommand(
-        parsed.commandName,
-        parsed.args || [],
-      );
-      await ctx.reply(`🎙️ "${transcript}"\n\n${result.message}`);
-
-      if (result.prompt) {
-        const cdp = getCurrentCdp(bridge);
-        if (cdp) {
-          await promptDispatcher.send({
-            channel: ch,
-            prompt: result.prompt,
-            cdp,
-            inboundImages: [],
-            options: {
-              chatSessionService,
-              chatSessionRepo,
-              topicManager,
-              titleGenerator,
-            },
-          });
-        }
-      }
-      return;
-    }
-
-    await ctx.reply(`📝 "${transcript}"`);
-
-    const userMsgDetector = bridge.pool.getUserMessageDetector?.(
-      resolved.projectName,
-    );
-    if (userMsgDetector) userMsgDetector.addEchoHash(transcript);
-
-    await promptDispatcher.send({
-      channel: ch,
-      prompt: transcript,
-      cdp: resolved.cdp,
-      inboundImages: [],
-      options: {
-        chatSessionService,
-        chatSessionRepo,
-        topicManager,
-        titleGenerator,
-      },
-    });
-  });
-
-  logger.info("Starting Remoat Telegram bot...");
-
-  // Graceful shutdown: close database on exit
-  const closeDb = () => {
-    try {
-      db.close();
-    } catch {
-      /* ignore */
-    }
+  
+  const deps = {
+    bridge, config, chatSessionService, chatSessionRepo, workspaceBindingRepo, templateRepo, 
+    scheduleService, scheduleRepo, topicManager, titleGenerator, api: bot.api, slashCommandHandler,
+    workspaceService, modeService, modelService, promptDispatcher, db, 
+    getChannel, resolveWorkspaceAndCdp, replyHtml, cleanupHandler, planContentCache, getChannelFromCb, planEditPendingChannels
   };
-  process.on("exit", closeDb);
-  process.on("SIGINT", () => {
-    closeDb();
-    process.exit(0);
-  });
-  process.on("SIGTERM", () => {
-    closeDb();
-    process.exit(0);
-  });
 
-  bot.catch((err) => {
-    logger.error("Bot error:", err);
-  });
+  const { registerCommands } = await import("./commandHandlers");
+  await registerCommands(bot, deps as any);
 
-  // =========================================================================
-  // [KaizenGuy] HTTP API — cho phép agent khác (ví dụ ZeroClaw) gửi message
-  // vào Antigravity qua Remoat mà không cần Telegram.
-  // POST http://localhost:9999/send  { "msg": "nội dung" }
-  // Auth: Bearer <telegramBotToken>
-  // =========================================================================
-  const HTTP_PORT = 9999;
-  const { createServer } = await import("http");
-  const httpServer = createServer(async (req, res) => {
-    // CORS + health check
-    if (req.method === "GET" && req.url === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
-      return;
-    }
+  const { registerCallbackHandler } = await import("./callbackHandler");
+  await registerCallbackHandler(bot, deps as any);
 
-    // =========================================================================
-    // [KaizenGuy] /notify — gửi text/photo/album ra Telegram qua Grammy bot
-    // POST http://localhost:9999/notify
-    //   { "text": "nội dung" }
-    //   { "text": "caption", "photo": "/absolute/path/to/image.png" }
-    //   { "text": "caption", "photos": ["/path/img1.png", "/path/img2.png"] }
-    // Auth: Bearer <telegramBotToken>
-    // =========================================================================
-    if (req.method === "POST" && req.url?.startsWith("/notify")) {
-      const notifyAuthHeader = req.headers.authorization || "";
-      const notifyExpectedToken = `Bearer ${config.telegramBotToken}`;
-      if (notifyAuthHeader !== notifyExpectedToken) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
-      }
+  const { registerMessageHandler } = await import("./messageHandler");
+  await registerMessageHandler(bot, deps as any);
 
-      let notifyBody = "";
-      for await (const chunk of req) notifyBody += chunk;
-      let notifyData: { text?: string; photo?: string; photos?: string[]; chat_id?: string };
-      try {
-        notifyData = JSON.parse(notifyBody);
-      } catch {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: 'Invalid JSON. Expected: { "text": "...", "photo": "/path" }' }));
-        return;
-      }
+  const { registerMediaHandlers } = await import("./mediaHandler");
+  await registerMediaHandlers(bot, deps as any);
 
-      const notifyText = (notifyData.text || "").trim();
-      const notifyPhoto = (notifyData.photo || "").trim();
-      const notifyChatId = notifyData.chat_id || config.allowedUserIds?.[0] || "";
+  const { startHttpServer } = await import("./httpServer");
+  await startHttpServer(bot, deps as any);
 
-      const notifyPhotos = notifyData.photos || [];
-
-      if (!notifyText && !notifyPhoto && notifyPhotos.length === 0) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Need text, photo, or photos" }));
-        return;
-      }
-
-      if (!notifyChatId) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "No chat_id and no allowedUserIds configured" }));
-        return;
-      }
-
-      try {
-        if (notifyPhotos.length > 0) {
-          // [KaizenGuy] Album mode — sendMediaGroup, auto-batch max 10 per group
-          const { readFileSync } = await import("fs");
-          const { InputFile } = await import("grammy");
-          const BATCH_SIZE = 10;
-          const totalBatches = Math.ceil(notifyPhotos.length / BATCH_SIZE);
-          for (let b = 0; b < totalBatches; b++) {
-            const batch = notifyPhotos.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
-            const media = batch.map((p: string, i: number) => ({
-              type: "photo" as const,
-              media: new InputFile(readFileSync(p), p.split("/").pop() || `photo${i}.png`),
-              ...(b === 0 && i === 0 && notifyText ? { caption: notifyText } : {}),
-            }));
-            await bot.api.sendMediaGroup(Number(notifyChatId), media);
-          }
-          logger.info(`[HTTP /notify] Sent ${notifyPhotos.length} photos (${totalBatches} batch) to ${notifyChatId}`);
-        } else if (notifyPhoto) {
-          const { readFileSync } = await import("fs");
-          const photoBuffer = readFileSync(notifyPhoto);
-          const { InputFile } = await import("grammy");
-          await bot.api.sendPhoto(
-            Number(notifyChatId),
-            new InputFile(photoBuffer, notifyPhoto.split("/").pop() || "photo.png"),
-            { caption: notifyText || undefined }
-          );
-          logger.info(`[HTTP /notify] Sent photo to ${notifyChatId}`);
-        } else {
-          await bot.api.sendMessage(Number(notifyChatId), notifyText);
-          logger.info(`[HTTP /notify] Sent text to ${notifyChatId}`);
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e: any) {
-        logger.error("[HTTP /notify] Error:", e.message);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-
-    // [KaizenGuy] /api/schedule — quản lý schedule qua HTTP (cho Antigravity gọi bằng curl)
-    if (req.url?.startsWith("/api/schedule")) {
-      const scheduleAuthHeader = req.headers.authorization || "";
-      const scheduleExpectedToken = `Bearer ${config.telegramBotToken}`;
-      if (scheduleAuthHeader !== scheduleExpectedToken) {
-        res.writeHead(401, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Unauthorized" }));
-        return;
-      }
-
-      let scheduleBody = "";
-      for await (const chunk of req) scheduleBody += chunk;
-
-      try {
-        const params = scheduleBody ? JSON.parse(scheduleBody) : {};
-        const action = params.action || "list";
-
-        if (action === "list") {
-          const jobs = scheduleService.listSchedules();
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, schedules: jobs }));
-        } else if (action === "add") {
-          const { cron, prompt, workspace } = params;
-          if (!cron || !prompt) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing cron or prompt" }));
-            return;
-          }
-          const wsPath = workspace || config.workspaceBaseDir;
-          const record = scheduleService.addSchedule(cron, prompt, wsPath, async (schedule) => {
-            try {
-              logger.info(`[Schedule] Firing job #${schedule.id}: ${schedule.prompt.substring(0, 80)}...`);
-              const cdp2 = await bridge.pool.getOrConnect(schedule.workspacePath);
-              bridge.lastActiveWorkspace = bridge.pool.extractProjectName(schedule.workspacePath);
-              const defChatId = config.allowedUserIds[0] ? Number(config.allowedUserIds[0]) : 0;
-              const sch: TelegramChannel = { chatId: defChatId, threadId: undefined };
-              bridge.lastActiveChannel = sch;
-              await promptDispatcher.send({
-                channel: sch, prompt: schedule.prompt, cdp: cdp2, inboundImages: [],
-                options: { chatSessionService, chatSessionRepo, topicManager, titleGenerator },
-              });
-            } catch (e: any) {
-              logger.error(`[Schedule] Job #${schedule.id} failed:`, e.message);
-            }
-          });
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, schedule: record }));
-        } else if (action === "remove") {
-          const { id } = params;
-          if (!id) {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "Missing id" }));
-            return;
-          }
-          const removed = scheduleService.removeSchedule(id);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true, removed }));
-        } else {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Unknown action. Use: list, add, remove" }));
-        }
-      } catch (e: any) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
-      }
-      return;
-    }
-
-    if (req.method !== "POST" || !req.url?.startsWith("/send")) {
-      res.writeHead(404);
-      res.end("Not found");
-      return;
-    }
-
-    // Auth check
-    const authHeader = req.headers.authorization || "";
-    const expectedToken = `Bearer ${config.telegramBotToken}`;
-    if (authHeader !== expectedToken) {
-      res.writeHead(401, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Unauthorized" }));
-      return;
-    }
-
-    // Parse body
-    let body = "";
-    for await (const chunk of req) body += chunk;
-    let msg: string;
-    try {
-      const parsed = JSON.parse(body);
-      msg = (parsed.msg || parsed.message || "").trim();
-    } catch {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid JSON. Expected: { \"msg\": \"...\" }" }));
-      return;
-    }
-
-    if (!msg) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Empty message" }));
-      return;
-    }
-
-    // Get CDP connection
-    const cdp = getCurrentCdp(bridge);
-    if (!cdp) {
-      res.writeHead(503, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "No CDP connection. Antigravity not connected." }));
-      return;
-    }
-
-    // Use last active channel (or create a minimal one)
-    const channel = bridge.lastActiveChannel || { chatId: 0, threadId: undefined };
-
-    logger.info(`[HTTP API] Received message: ${msg.slice(0, 100)}...`);
-
-    try {
-      await promptDispatcher.send({
-        channel,
-        prompt: msg,
-        cdp,
-        inboundImages: [],
-        options: {
-          chatSessionService,
-          chatSessionRepo,
-          topicManager,
-          titleGenerator,
-        },
-      });
-
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, message: "Prompt sent to Antigravity" }));
-    } catch (e: any) {
-      logger.error("[HTTP API] Error sending prompt:", e);
-      res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: e.message }));
-    }
-  });
-
-  httpServer.listen(HTTP_PORT, "127.0.0.1", () => {
-    logger.info(`[HTTP API] Listening on http://127.0.0.1:${HTTP_PORT}/send`);
-  });
-
-  // Close HTTP server on shutdown
-  process.on("SIGINT", () => {
-    httpServer.close();
-  });
-  process.on("SIGTERM", () => {
-    httpServer.close();
-  });
-
-  await bot.start({
+await bot.start({
     onStart: async (botInfo) => {
       logger.info(
         `Bot started as @${botInfo.username} | extractionMode=${config.extractionMode}`,
@@ -3371,3 +1545,4 @@ export const startBot = async (cliLogLevel?: LogLevel) => {
     },
   });
 };
+

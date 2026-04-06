@@ -13,6 +13,7 @@ export interface AppConfig {
     useTopics: boolean;
     disableProgressLog: boolean;
     enableTelegramHint: boolean;
+    forumGroupId: number | null;
 }
 
 export type ResponseDeliveryMode = 'stream';
