@@ -358,6 +358,9 @@ export function ensurePlanningDetector(
     logger.debug(`[PlanningDetector:${projectName}] Started`);
 }
 
+// [KaizenGuy] Fallback model when quota is exhausted
+const FALLBACK_MODEL = 'Gemini 3.1 Pro (High)';
+
 export function ensureErrorPopupDetector(
     bridge: CdpBridge,
     cdp: CdpService,
@@ -368,6 +371,26 @@ export function ensureErrorPopupDetector(
 
     let lastMessageId: number | null = null;
     let lastMessageChatId: number | string | null = null;
+
+    // [KaizenGuy] Auto-recovery rate limiting
+    const retryTimestamps: number[] = [];
+    const MAX_RETRIES = 3;
+    const RETRY_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+    let quotaSwitchDone = false; // max 1 model switch per detector lifecycle
+
+    const isQuotaError = (body: string): boolean => {
+        const lower = (body || '').toLowerCase();
+        return lower.includes('quota') || lower.includes('exhausted') || lower.includes('rate limit');
+    };
+
+    const canAutoRetry = (): boolean => {
+        const now = Date.now();
+        // Purge old timestamps outside window
+        while (retryTimestamps.length > 0 && now - retryTimestamps[0] > RETRY_WINDOW_MS) {
+            retryTimestamps.shift();
+        }
+        return retryTimestamps.length < MAX_RETRIES;
+    };
 
     const detector = new ErrorPopupDetector({
         cdpService: cdp,
@@ -392,6 +415,46 @@ export function ensureErrorPopupDetector(
             const targetChannelStr = targetChannel.threadId ? String(targetChannel.threadId) : String(targetChannel.chatId);
             const bodyText = info.body || t('An error occurred in the Antigravity agent.');
 
+            // [KaizenGuy] Auto-recovery logic
+            if (isQuotaError(bodyText)) {
+                // === QUOTA ERROR: auto-switch model ===
+                if (!quotaSwitchDone) {
+                    quotaSwitchDone = true;
+                    logger.info(`[ErrorPopupDetector:${projectName}] Quota error — auto-switching to ${FALLBACK_MODEL}`);
+
+                    // Dismiss the error first
+                    await detector.clickDismissButton();
+                    await new Promise(r => setTimeout(r, 1000));
+
+                    // Switch model
+                    const switchResult = await cdp.setUiModel(FALLBACK_MODEL);
+                    const switchOk = switchResult?.ok ?? false;
+
+                    const notifyText = switchOk
+                        ? `⚡ <b>Quota hết — đã tự đổi sang ${escapeHtml(FALLBACK_MODEL)}</b>\n\nAgent sẽ tiếp tục với model mới.\n<b>Workspace:</b> ${escapeHtml(projectName)}`
+                        : `⚠️ <b>Quota hết — đổi model thất bại</b>\n\n${escapeHtml(switchResult?.error || 'Unknown error')}\n<b>Workspace:</b> ${escapeHtml(projectName)}`;
+
+                    await sendTelegramMessage(bridge.botApi, targetChannel, notifyText);
+                    return;
+                }
+                // Already switched once — fall through to manual notification
+                logger.warn(`[ErrorPopupDetector:${projectName}] Quota error again after model switch — manual intervention needed`);
+            } else if (canAutoRetry()) {
+                // === GENERAL ERROR: auto-retry ===
+                retryTimestamps.push(Date.now());
+                logger.info(`[ErrorPopupDetector:${projectName}] Auto-retrying (${retryTimestamps.length}/${MAX_RETRIES} in window)`);
+
+                const clicked = await detector.clickRetryButton();
+                if (clicked) {
+                    const notifyText = `🔄 <b>Auto-retry</b> (${retryTimestamps.length}/${MAX_RETRIES})\n\n<i>${escapeHtml(bodyText.substring(0, 200))}</i>\n<b>Workspace:</b> ${escapeHtml(projectName)}`;
+                    await sendTelegramMessage(bridge.botApi, targetChannel, notifyText);
+                    return;
+                }
+                // Click failed — fall through to manual notification
+                logger.warn(`[ErrorPopupDetector:${projectName}] Auto-retry click failed, sending manual notification`);
+            }
+
+            // === FALLBACK: manual notification with buttons ===
             let text = `❌ <b>${escapeHtml(info.title || 'Agent Error')}</b>\n\n`;
             text += escapeHtml(bodyText.substring(0, 3800)) + `\n\n`;
             text += `<b>Buttons:</b> ${escapeHtml(info.buttons.join(', ') || '(None)')}\n`;

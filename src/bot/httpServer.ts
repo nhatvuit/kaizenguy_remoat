@@ -150,7 +150,7 @@ const HTTP_PORT = 9999;
     //   { "text": "caption", "photos": ["/path/img1.png", "/path/img2.png"] }
     // Auth: Bearer <telegramBotToken>
     // =========================================================================
-    if (req.method === "POST" && req.url?.startsWith("/notify")) {
+    if (req.method === "POST" && req.url === "/notify") {
       const notifyAuthHeader = req.headers.authorization || "";
       const notifyExpectedToken = `Bearer ${config.telegramBotToken}`;
       if (notifyAuthHeader !== notifyExpectedToken) {

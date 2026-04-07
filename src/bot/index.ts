@@ -687,11 +687,8 @@ async function sendPromptToAntigravity(
 
     // [KaizenGuy] Append Telegram delivery hint so the agent knows output
     // will be displayed on Telegram and can format response accordingly.
-    // We pass chat_id and topic_id if available, so agent can route notifications properly.
-    let TELEGRAM_HINT = `\n\n[remoat:telegram]`;
-    if (channel.threadId && channel.chatId === loadConfig().forumGroupId) {
-      TELEGRAM_HINT = `\n\n[remoat:telegram:chat=${channel.chatId}:topic=${channel.threadId}]`;
-    }
+    // The user requested to simplify this to just [remoat].
+    let TELEGRAM_HINT = `\n\n[remoat]`;
 
     const hintedPrompt = loadConfig().enableTelegramHint
       ? prompt + TELEGRAM_HINT
@@ -747,18 +744,17 @@ async function sendPromptToAntigravity(
     // [KaizenGuy] Event-Driven Architecture bypass:
     // Instead of waiting for DOM via ResponseMonitor, we wait 4s and release immediately.
     // The Agent is entirely responsible for calling /notify.
-    if (!loadConfig().useTopics || channel.chatId === loadConfig().forumGroupId) {
-      await new Promise((resolve) => setTimeout(resolve, 300));
-      isFinalized = true;
-      userStopRequestedChannels.delete(channelKey(channel));
-      // Xóa tin nhắn "Thinking..." do mình chèn lúc nãy đi để sạch giao diện Tele
-      if (liveActivityMsgId) {
-        try {
-          await api.deleteMessage(channel.chatId, liveActivityMsgId);
-        } catch (e) {}
-      }
-      return;
+    // Changed to apply globally (tắt cái luồng bắt DOM)
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    isFinalized = true;
+    userStopRequestedChannels.delete(channelKey(channel));
+    // Xóa tin nhắn "Thinking..." do mình chèn lúc nãy đi để sạch giao diện Tele
+    if (liveActivityMsgId) {
+      try {
+        await api.deleteMessage(channel.chatId, liveActivityMsgId);
+      } catch (e) {}
     }
+    return;
 
     await new Promise<void>((resolve) => {
       let isResolved = false;

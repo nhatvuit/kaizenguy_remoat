@@ -23,75 +23,19 @@ export interface ErrorPopupDetectorOptions {
     onResolved?: () => void;
 }
 
-/**
- * Detection script for the Antigravity UI error popup.
- *
- * Looks for dialog/modal containers containing error-related text patterns
- * like "agent terminated", "error", "failed", etc. and extracts popup info.
- */
-const DETECT_ERROR_POPUP_SCRIPT = `(() => {
-    const ERROR_PATTERNS = [
-        'agent terminated',
-        'terminated due to error',
-        'unexpected error',
-        'something went wrong',
-        'an error occurred',
-    ];
-
-    const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-
-    // Try dialog/modal first
-    const dialogs = Array.from(document.querySelectorAll(
-        '[role="dialog"], [role="alertdialog"], .modal, .dialog'
-    )).filter(el => el.offsetParent !== null || el.getAttribute('aria-modal') === 'true');
-
-    // Fallback: look for fixed/absolute positioned overlays
-    if (dialogs.length === 0) {
-        const overlays = Array.from(document.querySelectorAll('div[class*="fixed"], div[class*="absolute"]'))
-            .filter(el => {
-                const style = window.getComputedStyle(el);
-                return (style.position === 'fixed' || style.position === 'absolute')
-                    && style.zIndex && parseInt(style.zIndex, 10) > 10
-                    && el.querySelector('button');
-            });
-        dialogs.push(...overlays);
-    }
-
-    for (const dialog of dialogs) {
-        const fullText = normalize(dialog.textContent || '');
-        const isError = ERROR_PATTERNS.some(p => fullText.includes(p));
-        if (!isError) continue;
-
-        // Extract title from heading elements or first prominent text
-        const headingEl = dialog.querySelector('h1, h2, h3, h4, [class*="title"], [class*="heading"]');
-        const title = headingEl ? (headingEl.textContent || '').trim() : '';
-
-        // Extract body text (excluding button text and title)
-        const allButtons = Array.from(dialog.querySelectorAll('button'))
-            .filter(btn => btn.offsetParent !== null);
-        const buttonTexts = new Set(allButtons.map(btn => (btn.textContent || '').trim()));
-
-        const bodyParts = [];
-        const walker = document.createTreeWalker(dialog, NodeFilter.SHOW_TEXT);
-        let node;
-        while ((node = walker.nextNode())) {
-            const text = (node.textContent || '').trim();
-            if (!text) continue;
-            if (buttonTexts.has(text)) continue;
-            if (text === title) continue;
-            bodyParts.push(text);
-        }
-        const body = bodyParts.join(' ').slice(0, 1000);
-
-        const buttons = allButtons.map(btn => (btn.textContent || '').trim()).filter(t => t.length > 0);
-
-        if (buttons.length === 0) continue;
-
-        return { title: title || 'Error', body, buttons };
-    }
-
-    return null;
-})()`;
+const ERROR_PATTERNS = [
+    'agent terminated',
+    'terminated due to error',
+    'unexpected error',
+    'something went wrong',
+    'an error occurred',
+    'quota',
+    'rate limit',
+    'exhausted',
+    'retry',
+    '429',
+    'api key',
+];
 
 /**
  * Read clipboard content via navigator.clipboard.readText().
@@ -138,25 +82,24 @@ export class ErrorPopupDetector {
         this.pollIntervalMs = options.pollIntervalMs ?? 3000;
         this.onErrorPopup = options.onErrorPopup;
         this.onResolved = options.onResolved;
+        
+        this.handleConsoleMessage = this.handleConsoleMessage.bind(this);
     }
 
-    /** Start monitoring. */
+    /** Start monitoring via CDP event. */
     start(): void {
         if (this.isRunning) return;
         this.isRunning = true;
         this.lastDetectedKey = null;
         this.lastDetectedInfo = null;
         this.lastNotifiedAt = 0;
-        this.schedulePoll();
+        this.cdpService.on('Runtime.consoleAPICalled', this.handleConsoleMessage);
     }
 
     /** Stop monitoring. */
     async stop(): Promise<void> {
         this.isRunning = false;
-        if (this.pollTimer) {
-            clearTimeout(this.pollTimer);
-            this.pollTimer = null;
-        }
+        this.cdpService.off('Runtime.consoleAPICalled', this.handleConsoleMessage);
     }
 
     /** Return the last detected error popup info. Returns null if nothing has been detected. */
@@ -208,71 +151,38 @@ export class ErrorPopupDetector {
         }
     }
 
-    /** Schedule the next poll. */
-    private schedulePoll(): void {
+    private handleConsoleMessage(params: any): void {
         if (!this.isRunning) return;
-        this.pollTimer = setTimeout(async () => {
-            await this.poll();
-            if (this.isRunning) {
-                this.schedulePoll();
-            }
-        }, this.pollIntervalMs);
-    }
 
-    /**
-     * Single poll iteration:
-     *   1. Detect error popup from DOM (with contextId)
-     *   2. Notify via callback only on new detection (prevent duplicates)
-     *   3. Reset lastDetectedKey / lastDetectedInfo when popup disappears
-     */
-    private async poll(): Promise<void> {
-        try {
-            const contextId = this.cdpService.getPrimaryContextId();
-            const callParams: Record<string, unknown> = {
-                expression: DETECT_ERROR_POPUP_SCRIPT,
-                returnByValue: true,
-                awaitPromise: false,
-            };
-            if (contextId !== null) {
-                callParams.contextId = contextId;
-            }
+        const type = params.type; // 'log', 'warning', 'error', etc.
+        if (type !== 'error' && type !== 'warning') return;
 
-            const result = await this.cdpService.call('Runtime.evaluate', callParams);
-            const info: ErrorPopupInfo | null = result?.result?.value ?? null;
+        const args = params.args || [];
+        const textParts = args.map((a: any) => a.value || a.description || '');
+        const fullText = textParts.join(' ');
+        const normalizedText = fullText.toLowerCase();
 
-            if (info) {
-                // Duplicate prevention: use title + body snippet as key
-                const key = `${info.title}::${info.body.slice(0, 100)}`;
-                const now = Date.now();
-                const withinCooldown = (now - this.lastNotifiedAt) < ErrorPopupDetector.COOLDOWN_MS;
-                if (key !== this.lastDetectedKey && !withinCooldown) {
-                    this.lastDetectedKey = key;
-                    this.lastDetectedInfo = info;
-                    this.lastNotifiedAt = now;
-                    Promise.resolve(this.onErrorPopup(info)).catch((err) => {
-                        logger.error('[ErrorPopupDetector] onErrorPopup callback failed:', err);
-                    });
-                } else if (key === this.lastDetectedKey) {
-                    // Same key -- update stored info silently
-                    this.lastDetectedInfo = info;
-                }
-            } else {
-                // Reset when popup disappears (prepare for next detection)
-                const wasDetected = this.lastDetectedKey !== null;
-                this.lastDetectedKey = null;
-                this.lastDetectedInfo = null;
-                if (wasDetected && this.onResolved) {
-                    this.onResolved();
-                }
-            }
-        } catch (error) {
-            // Ignore CDP errors and continue monitoring
-            const message = error instanceof Error ? error.message : String(error);
-            if (message.includes('WebSocket is not connected') || message.includes('WebSocket disconnected')) {
-                return;
-            }
-            logger.error('[ErrorPopupDetector] Error during polling:', error);
-        }
+        const isError = ERROR_PATTERNS.some(p => normalizedText.includes(p));
+        if (!isError) return;
+
+        const now = Date.now();
+        if (now - this.lastNotifiedAt < ErrorPopupDetector.COOLDOWN_MS) return;
+
+        this.lastNotifiedAt = now;
+
+        const title = type === 'error' ? 'Console Error' : 'Console Warning';
+        const body = fullText.substring(0, 1000);
+        
+        // Cung cấp các nút chuẩn để Telegram hiển thị (các nút này gọi CDP click)
+        const buttons = ['Dismiss', 'Copy Debug', 'Retry'];
+
+        const info: ErrorPopupInfo = { title, body, buttons };
+        this.lastDetectedInfo = info;
+        this.lastDetectedKey = `${title}::${body.slice(0, 100)}`;
+        
+        Promise.resolve(this.onErrorPopup(info)).catch((err) => {
+            logger.error('[ErrorPopupDetector] onErrorPopup callback failed:', err);
+        });
     }
 
     /** Internal click handler using buildClickScript from approvalDetector. */

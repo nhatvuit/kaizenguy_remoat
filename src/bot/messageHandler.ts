@@ -139,6 +139,9 @@ bot.on("message:text", async (ctx) => {
 
     if (!text) return;
 
+    // [KaizenGuy] Send typing indicator immediately so user knows bot received the message
+    api.sendChatAction(ch.chatId, "typing", { message_thread_id: ch.threadId }).catch(() => {});
+
     // [KaizenGuy] Khi đã cấu hình forum group, bỏ qua tin nhắn từ chat 1-1
     // để tránh response bị gửi nhầm kênh
     if (config.forumGroupId && ctx.chat?.type === "private") {
