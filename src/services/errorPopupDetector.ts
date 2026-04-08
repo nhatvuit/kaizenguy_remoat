@@ -50,9 +50,46 @@ const READ_CLIPBOARD_SCRIPT = `(async () => {
     }
 })()`;
 
+const DETECT_ERROR_POPUP_SCRIPT = `(() => {
+    const normalize = (text) => (text || '').toLowerCase().trim();
+    const buttons = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null);
+    
+    const retryBtn = buttons.find(b => normalize(b.textContent) === 'retry');
+    const dismissBtn = buttons.find(b => normalize(b.textContent) === 'dismiss');
+    
+    if (!retryBtn && !dismissBtn) return null;
+    
+    const container = (retryBtn || dismissBtn).closest('[role="dialog"], .modal, .dialog, .error-container, .bg-red-50, .border-red-500, div[class*="border"], div[class*="shadow"]') || (retryBtn || dismissBtn).parentElement;
+    
+    let title = 'Agent Error';
+    let body = '';
+    
+    if (container) {
+        const headings = container.querySelectorAll('h1, h2, h3, h4, .text-lg, .font-bold');
+        if (headings.length > 0) {
+            title = Array.from(headings).map(h => h.textContent.trim()).join(' ');
+        }
+        
+        const pars = container.querySelectorAll('p, .text-sm, span');
+        if (pars.length > 0) {
+            body = Array.from(pars)
+                .map(p => p.textContent.trim())
+                .filter(t => t.length > 0 && normalize(t) !== 'retry' && normalize(t) !== 'dismiss')
+                .join('\\n');
+        } else {
+            body = (container.textContent || '').replace(/\\s+/g, ' ').substring(0, 500);
+        }
+    }
+    
+    const containerButtons = container ? Array.from(container.querySelectorAll('button')).filter(b => b.offsetParent !== null) : buttons;
+    const buttonTexts = containerButtons.map(b => b.textContent.trim()).filter(Boolean);
+    
+    return { title, body: body.substring(0, 1000), buttons: buttonTexts };
+})()`;
+
 /**
  * Detects error popup dialogs (e.g. "Agent terminated due to error") in the
- * Antigravity UI via polling.
+ * Antigravity UI via polling and console.error interception.
  *
  * Follows the same polling pattern as PlanningDetector / ApprovalDetector:
  * - start()/stop() lifecycle
@@ -86,7 +123,7 @@ export class ErrorPopupDetector {
         this.handleConsoleMessage = this.handleConsoleMessage.bind(this);
     }
 
-    /** Start monitoring via CDP event. */
+    /** Start monitoring via CDP event and DOM polling. */
     start(): void {
         if (this.isRunning) return;
         this.isRunning = true;
@@ -94,11 +131,16 @@ export class ErrorPopupDetector {
         this.lastDetectedInfo = null;
         this.lastNotifiedAt = 0;
         this.cdpService.on('Runtime.consoleAPICalled', this.handleConsoleMessage);
+        this.schedulePoll();
     }
 
     /** Stop monitoring. */
     async stop(): Promise<void> {
         this.isRunning = false;
+        if (this.pollTimer) {
+            clearTimeout(this.pollTimer);
+            this.pollTimer = null;
+        }
         this.cdpService.off('Runtime.consoleAPICalled', this.handleConsoleMessage);
     }
 
@@ -148,6 +190,60 @@ export class ErrorPopupDetector {
         } catch (error) {
             logger.error('[ErrorPopupDetector] Error reading clipboard:', error);
             return null;
+        }
+    }
+
+    private schedulePoll(): void {
+        if (!this.isRunning) return;
+        this.pollTimer = setTimeout(async () => {
+            await this.poll();
+            if (this.isRunning) {
+                this.schedulePoll();
+            }
+        }, this.pollIntervalMs);
+    }
+
+    private async poll(): Promise<void> {
+        try {
+            const contextId = this.cdpService.getPrimaryContextId();
+            const callParams: Record<string, unknown> = {
+                expression: DETECT_ERROR_POPUP_SCRIPT,
+                returnByValue: true,
+                awaitPromise: false,
+            };
+            if (contextId !== null) {
+                callParams.contextId = contextId;
+            }
+
+            const result = await this.cdpService.call('Runtime.evaluate', callParams);
+            const info: ErrorPopupInfo | null = result?.result?.value ?? null;
+
+            if (info) {
+                const now = Date.now();
+                if (now - this.lastNotifiedAt < ErrorPopupDetector.COOLDOWN_MS) return;
+
+                const key = `${info.title}::${info.body.slice(0, 50)}`;
+                if (key !== this.lastDetectedKey) {
+                    this.lastNotifiedAt = now;
+                    this.lastDetectedKey = key;
+                    this.lastDetectedInfo = info;
+                    Promise.resolve(this.onErrorPopup(info)).catch((err) => {
+                        logger.error('[ErrorPopupDetector] onErrorPopup callback failed:', err);
+                    });
+                }
+            } else {
+                const wasDetected = this.lastDetectedKey !== null;
+                if (wasDetected && this.onResolved) {
+                    this.onResolved();
+                }
+                this.lastDetectedKey = null;
+                this.lastDetectedInfo = null;
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            if (!message.includes('WebSocket')) {
+                logger.error('[ErrorPopupDetector] Error during polling:', error);
+            }
         }
     }
 
