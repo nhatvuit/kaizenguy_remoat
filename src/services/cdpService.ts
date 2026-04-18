@@ -58,6 +58,32 @@ const SELECTORS = {
     CONTEXT_URL_KEYWORD: 'cascade-panel',
 };
 
+/**
+ * [KaizenGuy] Utility/built-in page titles to exclude from workspace discovery.
+ * These are VS Code internal pages that don't have a cascade-panel.
+ * Using a shared list avoids blacklist whack-a-mole (2026-04-18).
+ */
+const UTILITY_PAGE_TITLES = [
+    'Launchpad', 'Manager', 'Settings', 'Extensions',
+    'Keyboard Shortcuts', 'Output', 'Debug Console',
+];
+
+/**
+ * [KaizenGuy] Check if a CDP target looks like a real workspace page.
+ * Positive match: title contains em dash separator ("project — file").
+ * Negative filter: excludes known utility pages.
+ */
+function isWorkspacePage(target: any): boolean {
+    if (target.type !== 'page' || !target.webSocketDebuggerUrl) return false;
+    if (target.url?.includes('workbench-jetski-agent')) return false;
+    const title = target.title || '';
+    // Exclude known utility pages
+    if (UTILITY_PAGE_TITLES.some(u => title === u || title.startsWith(u + ' '))) return false;
+    // Must look like a workbench page
+    if (!target.url?.includes('workbench') && !title.includes('Antigravity') && !title.includes('Cascade')) return false;
+    return true;
+}
+
 export class CdpService extends EventEmitter {
     private ports: number[];
     private isConnectedFlag: boolean = false;
@@ -116,6 +142,10 @@ export class CdpService extends EventEmitter {
         });
     }
 
+    /**
+     * [KaizenGuy] Rewritten with positive match + DOM probe fallback (2026-04-18).
+     * Priority: workspace page (title with em dash) > any non-utility workbench page > Launchpad.
+     */
     async discoverTarget(): Promise<string> {
         let allPages: any[] = [];
         for (const port of this.ports) {
@@ -127,22 +157,17 @@ export class CdpService extends EventEmitter {
             }
         }
 
-        let target = allPages.find(t =>
-            t.type === 'page' &&
-            t.webSocketDebuggerUrl &&
-            !t.title?.includes('Launchpad') &&
-            !t.url?.includes('workbench-jetski-agent') &&
-            (t.url?.includes('workbench') || t.title?.includes('Antigravity') || t.title?.includes('Cascade'))
-        );
+        const candidates = allPages.filter(isWorkspacePage);
 
-        if (!target) {
-            target = allPages.find(t =>
-                t.webSocketDebuggerUrl &&
-                (t.url?.includes('workbench') || t.title?.includes('Antigravity') || t.title?.includes('Cascade')) &&
-                !t.title?.includes('Launchpad')
-            );
+        // Priority 1: page with em dash in title ("projectName — fileName") = real workspace
+        let target = candidates.find(t => /\s[—–]\s/.test(t.title || ''));
+
+        // Priority 2: any remaining workspace candidate
+        if (!target && candidates.length > 0) {
+            target = candidates[0];
         }
 
+        // Priority 3: Launchpad as last resort
         if (!target) {
             target = allPages.find(t =>
                 t.webSocketDebuggerUrl &&
@@ -376,15 +401,8 @@ export class CdpService extends EventEmitter {
             return this.launchAndConnectWorkspace(workspacePath, projectName);
         }
 
-        // Filter workbench pages only (exclude Launchpad, Manager, iframe, worker)
-        const workbenchPages = pages.filter(
-            (t: any) =>
-                t.type === 'page' &&
-                t.webSocketDebuggerUrl &&
-                !t.title?.includes('Launchpad') &&
-                !t.url?.includes('workbench-jetski-agent') &&
-                t.url?.includes('workbench'),
-        );
+        // [KaizenGuy] Filter workspace pages using shared helper (2026-04-18)
+        const workbenchPages = pages.filter(isWorkspacePage);
 
         logger.debug(`[CdpService] Searching for workspace "${projectName}" (port=${respondingPort})... ${workbenchPages.length} workbench pages:`);
         for (const p of workbenchPages) {
@@ -632,14 +650,8 @@ export class CdpService extends EventEmitter {
 
             if (pages.length === 0) continue;
 
-            const workbenchPages = pages.filter(
-                (t: any) =>
-                    t.type === 'page' &&
-                    t.webSocketDebuggerUrl &&
-                    !t.title?.includes('Launchpad') &&
-                    !t.url?.includes('workbench-jetski-agent') &&
-                    t.url?.includes('workbench'),
-            );
+            // [KaizenGuy] Filter workspace pages using shared helper (2026-04-18)
+            const workbenchPages = pages.filter(isWorkspacePage);
 
             // Title match
             const titleMatch = workbenchPages.find((t: any) => t.title?.toLowerCase().includes(projectName.toLowerCase()));
@@ -881,15 +893,30 @@ export class CdpService extends EventEmitter {
 
     /**
      * Focus the chat input field.
+     * [KaizenGuy] Scope to .antigravity-agent-side-panel first to avoid
+     * Codex and other extension chat panels (2026-04-18).
      */
     private async focusChatInput(): Promise<{ ok: boolean; contextId?: number; error?: string }> {
         const focusScript = `(() => {
-            const editors = Array.from(document.querySelectorAll('${SELECTORS.CHAT_INPUT}'));
+            const sel = '${SELECTORS.CHAT_INPUT}';
+            // Priority 1: textbox inside Antigravity panel
+            const panel = document.querySelector('.antigravity-agent-side-panel');
+            if (panel) {
+                const panelEditors = Array.from(panel.querySelectorAll(sel));
+                const panelVisible = panelEditors.filter(el => el.offsetParent !== null);
+                if (panelVisible.length > 0) {
+                    const editor = panelVisible[panelVisible.length - 1];
+                    editor.focus();
+                    return { ok: true, method: 'panel-scoped' };
+                }
+            }
+            // Priority 2: fallback to full document (panel may not exist yet)
+            const editors = Array.from(document.querySelectorAll(sel));
             const visible = editors.filter(el => el.offsetParent !== null);
             const editor = visible[visible.length - 1];
             if (!editor) return { ok: false, error: 'No editor found' };
             editor.focus();
-            return { ok: true };
+            return { ok: true, method: 'document-fallback' };
         })()`;
 
         for (const ctx of this.contexts) {

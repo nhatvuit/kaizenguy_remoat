@@ -120,7 +120,7 @@ const SCRAPE_PAST_CONVERSATIONS_SCRIPT = `(() => {
     }
 
     // Each conversation row is a div with cursor-pointer inside the QuickPick
-    const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"][class*="flex"][class*="items-center"][class*="justify-between"]'));
+    const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"][class*="flex"][class*="justify-between"]'));
     for (const row of rows) {
         if (!isVisible(row)) continue;
         // Skip rows below "Other Conversations" boundary
@@ -483,13 +483,31 @@ export class ChatSessionService {
             logger.info(`[listAllSessions] contexts=${ctxs.length} ids=${ctxs.map(c => c.id).join(',')}`);
 
             // Step 1: Find Past Conversations button
-            const btnState = await this.evaluateOnAnyContext(
+            let btnState = await this.evaluateOnAnyContext(
                 cdpService, FIND_PAST_CONVERSATIONS_BUTTON_SCRIPT, false,
             );
             logger.info(`[listAllSessions] Step1 btnState=${JSON.stringify(btnState)}`);
             if (!btnState?.found) {
                 logger.warn(`[listAllSessions] Past Conversations button NOT found`);
                 return [];
+            }
+
+            // [KaizenGuy] Auto-switch: if button is off-screen (another panel like Codex is active),
+            // click the "Agent" activity bar tab to bring Antigravity panel back (2026-04-18).
+            if (btnState.x < 0 || btnState.y < 0) {
+                logger.info(`[listAllSessions] Button off-screen (x=${btnState.x}), switching to Agent panel...`);
+                const switchResult = await this.ensureAgentPanelActive(cdpService);
+                if (switchResult) {
+                    await new Promise((r) => setTimeout(r, 500));
+                    btnState = await this.evaluateOnAnyContext(
+                        cdpService, FIND_PAST_CONVERSATIONS_BUTTON_SCRIPT, false,
+                    );
+                    logger.info(`[listAllSessions] After switch: btnState=${JSON.stringify(btnState)}`);
+                    if (!btnState?.found || btnState.x < 0) {
+                        logger.warn(`[listAllSessions] Still off-screen after switch`);
+                        return [];
+                    }
+                }
             }
 
             // Step 2: Click via CDP mouse events (reliable in Electron)
@@ -576,6 +594,36 @@ export class ChatSessionService {
         await cdpService.call('Input.dispatchMouseEvent', {
             type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
         });
+    }
+
+    /**
+     * [KaizenGuy] Click the "Agent" activity bar tab to bring Antigravity panel to foreground.
+     * Used when another panel (e.g. Codex) is covering it (2026-04-18).
+     */
+    private async ensureAgentPanelActive(cdpService: CdpService): Promise<boolean> {
+        const findAgentTabScript = `(() => {
+            const items = Array.from(document.querySelectorAll('.activitybar .action-item a'));
+            for (const a of items) {
+                const label = (a.getAttribute('aria-label') || '').toLowerCase();
+                if (label === 'agent') {
+                    const rect = a.getBoundingClientRect();
+                    if (rect.width > 0 && rect.height > 0) {
+                        return { found: true, x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+                    }
+                }
+            }
+            return { found: false };
+        })()`;
+
+        const result = await this.evaluateOnAnyContext(cdpService, findAgentTabScript, false);
+        if (!result?.found) {
+            logger.warn(`[ensureAgentPanelActive] Agent tab not found`);
+            return false;
+        }
+
+        logger.info(`[ensureAgentPanelActive] Clicking Agent tab at (${result.x}, ${result.y})`);
+        await this.cdpMouseClick(cdpService, result.x, result.y);
+        return true;
     }
 
     /**
@@ -850,7 +898,7 @@ export class ChatSessionService {
                 const container = qp.querySelector('.bg-quickinput-background') || qp;
                 const normalize = (text) => (text || '').toLowerCase().replace(/\\s+/g, ' ').trim();
                 const wanted = normalize(${safeTitle});
-                const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"][class*="flex"][class*="items-center"][class*="justify-between"]'));
+                const rows = Array.from(container.querySelectorAll('div[class*="cursor-pointer"][class*="flex"][class*="justify-between"]'));
                 const visibleRows = rows.filter(r => r.offsetParent !== null);
                 
                 // Try exact title match first (within span text)
