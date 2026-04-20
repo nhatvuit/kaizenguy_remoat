@@ -170,10 +170,14 @@ const HTTP_PORT = 9999;
         return;
       }
 
-      const notifyText = (notifyData.text || "").trim();
+      const notifyRawText = (notifyData.text || "").trim();
       const notifyPhoto = (notifyData.photo || "").trim();
       const notifyChatId = notifyData.chat_id || config.allowedUserIds?.[0] || "";
       const notifyTopicId = notifyData.topic_id ? Number(notifyData.topic_id) : undefined;
+
+      // [KaizenGuy] Auto-convert markdown→HTML if text looks like markdown (no HTML tags)
+      const looksLikeHtml = /<\/?(?:b|i|u|s|code|pre|a|blockquote)[\s>]/.test(notifyRawText);
+      const notifyText = looksLikeHtml ? notifyRawText : formatForTelegram(notifyRawText);
 
       const notifyPhotos = notifyData.photos || [];
 
@@ -205,7 +209,6 @@ const HTTP_PORT = 9999;
             }));
             await bot.api.sendMediaGroup(Number(notifyChatId), media, {
               message_thread_id: notifyTopicId
-              // Note: Grammy sendMediaGroup doesn't support a global parse_mode, each InputMediaPhoto needs it. I will add parse_mode to media directly below.
             });
           }
           logger.info(`[HTTP /notify] Sent ${notifyPhotos.length} photos (${totalBatches} batch) to ${notifyChatId}${notifyTopicId ? ` topic ${notifyTopicId}` : ''}`);
@@ -220,11 +223,15 @@ const HTTP_PORT = 9999;
           );
           logger.info(`[HTTP /notify] Sent photo to ${notifyChatId}${notifyTopicId ? ` topic ${notifyTopicId}` : ''}`);
         } else {
-          await bot.api.sendMessage(Number(notifyChatId), notifyText, {
-            message_thread_id: notifyTopicId,
-            parse_mode: "HTML"
-          });
-          logger.info(`[HTTP /notify] Sent text to ${notifyChatId}${notifyTopicId ? ` topic ${notifyTopicId}` : ''}`);
+          // [KaizenGuy] Split long HTML messages respecting tag boundaries
+          const chunks = splitTelegramHtml(notifyText, 4096);
+          for (const chunk of chunks) {
+            await bot.api.sendMessage(Number(notifyChatId), chunk, {
+              message_thread_id: notifyTopicId,
+              parse_mode: "HTML"
+            });
+          }
+          logger.info(`[HTTP /notify] Sent text (${chunks.length} chunk${chunks.length > 1 ? 's' : ''}) to ${notifyChatId}${notifyTopicId ? ` topic ${notifyTopicId}` : ''}`);
         }
 
         res.writeHead(200, { "Content-Type": "application/json" });
