@@ -667,6 +667,22 @@ export class ChatSessionService {
                 return { ok: false, error: 'New chat button not found' };
             }
 
+            // [KaizenGuy] Auto-switch: if button is off-screen (another panel like Codex is active),
+            // click the "Agent" activity bar tab to bring Antigravity panel back (2026-04-21).
+            if (btnState.found && (btnState.x < 0 || btnState.y < 0)) {
+                logger.info(`[startNewChat] Button off-screen (x=${btnState.x}), switching to Agent panel...`);
+                const switchResult = await this.ensureAgentPanelActive(cdpService);
+                if (switchResult) {
+                    await new Promise((r) => setTimeout(r, 500));
+                    contexts = cdpService.getContexts();
+                    btnState = await this.getNewChatButtonState(cdpService, contexts);
+                    logger.info(`[startNewChat] After switch: btnState=${JSON.stringify(btnState)}`);
+                    if (!btnState.found || btnState.x < 0) {
+                        return { ok: false, error: 'New chat button still off-screen after switching to Agent panel' };
+                    }
+                }
+            }
+
             // cursor: not-allowed -> already an empty chat (no need to create new)
             if (!btnState.enabled) {
                 return { ok: true };
